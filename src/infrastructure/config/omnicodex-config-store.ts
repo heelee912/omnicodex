@@ -18,7 +18,7 @@ export interface OmniCodexNgrokTunnelConfig {
   readonly executablePath: string;
   /** Reserved stable HTTPS origin, for example https://owner.ngrok.app. */
   readonly publicUrl: string;
-  readonly credentialRef?: string;
+  readonly credentialRef: string;
 }
 
 export interface OmniCodexExternalTunnelConfig {
@@ -372,6 +372,8 @@ function validateTunnel(tunnel: OmniCodexTunnelConfig, auth: OmniCodexAuthConfig
     !/^[A-Za-z0-9._:/-]{1,512}$/.test(tunnel.credentialRef)
   )
     throw new Error("Invalid tunnel credential reference");
+  if (tunnel.kind === "ngrok" && !tunnel.credentialRef.startsWith("dpapi:v1:"))
+    throw new Error("ngrok requires a CurrentUser DPAPI credential reference");
   const publicUrl = parseStableHttpsOrigin(tunnel.publicUrl);
   const protectedResource = auth.resource ?? auth.audience;
   let resourceUrl: URL;

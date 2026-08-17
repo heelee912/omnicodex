@@ -145,6 +145,7 @@ describe("OmniCodex config store", () => {
         kind: "ngrok",
         executablePath: "C:\\tools\\ngrok.exe",
         publicUrl: "https://owner.ngrok.app",
+        credentialRef: "dpapi:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       },
     };
     await saveOmniCodexConfig(withTunnel, configPath);
@@ -158,11 +159,27 @@ describe("OmniCodex config store", () => {
             kind: "ngrok",
             executablePath: "C:\\tools\\ngrok.exe",
             publicUrl: "https://other.ngrok.app",
+            credentialRef: "dpapi:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           },
         },
         configPath,
       ),
     ).rejects.toThrow("must match");
+
+    await expect(
+      saveOmniCodexConfig(
+        {
+          ...withTunnel,
+          tunnel: {
+            kind: "ngrok",
+            executablePath: "C:\\tools\\ngrok.exe",
+            publicUrl: "https://owner.ngrok.app",
+            credentialRef: "wincred:legacy",
+          },
+        },
+        configPath,
+      ),
+    ).rejects.toThrow("CurrentUser DPAPI");
   });
 
   it.each(["cloudflare", "tailscale"] as const)(

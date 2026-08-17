@@ -854,6 +854,8 @@ tunnelSet
     await requireStoppedDaemon();
     if (options.credentialRef !== undefined && options.authtokenStdin === true)
       throw new Error("Use either --credential-ref or --authtoken-stdin, not both");
+    if (options.credentialRef === undefined && options.authtokenStdin !== true)
+      throw new Error("ngrok requires --authtoken-stdin or --credential-ref");
     const config = await loadOmniCodexConfig();
     const executablePath = await resolveNgrokExecutable(options.executable);
     const secretStore = new WindowsDpapiSecretStore({
@@ -865,11 +867,12 @@ tunnelSet
       createdReference = await secretStore.put("ngrok-authtoken", await readSecretFromStdin());
       credentialRef = createdReference;
     }
+    if (credentialRef === undefined) throw new Error("ngrok credential reference is unavailable");
     const tunnelConfig = {
       kind: "ngrok" as const,
       executablePath,
       publicUrl: options.url,
-      ...(credentialRef === undefined ? {} : { credentialRef }),
+      credentialRef,
     };
     const updated: OmniCodexConfig = {
       ...config,
