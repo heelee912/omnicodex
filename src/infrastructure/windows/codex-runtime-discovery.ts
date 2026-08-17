@@ -172,7 +172,7 @@ export class CodexRuntimeDiscovery {
       // The file was readable above; retaining the normalized path is safer
       // than dropping a usable candidate when a filesystem cannot realpath it.
     }
-    const productVersion = await this.#readProductVersion(canonicalPath);
+    const productVersion = await this.#readProductVersion(requestedPath);
     return {
       executablePath: requestedPath,
       canonicalPath,
