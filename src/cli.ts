@@ -42,6 +42,7 @@ import {
   terminateOwnedHiddenChild,
 } from "./infrastructure/windows/hidden-child-process.js";
 import { WindowsAutostartManager } from "./infrastructure/windows/windows-autostart-manager.js";
+import { WindowsDpapiSecretStore } from "./infrastructure/windows/windows-dpapi-secret-store.js";
 
 const program = new Command()
   .name("omnicodex")
@@ -845,17 +846,52 @@ tunnelSet
   .description("Use a stable reserved ngrok HTTPS origin")
   .requiredOption("--url <origin>", "reserved HTTPS origin, for example https://owner.ngrok.app")
   .option("--executable <path>", "ngrok executable path")
+  .option("--credential-ref <reference>", "existing CurrentUser DPAPI credential reference")
+  .option("--authtoken-stdin", "read the ngrok authtoken from stdin and protect it with DPAPI")
   .option("--json", "emit machine-readable JSON")
   .action(async (options: NgrokTunnelOptions) => {
     await requireStoppedDaemon();
+    if (options.credentialRef !== undefined && options.authtokenStdin === true)
+      throw new Error("Use either --credential-ref or --authtoken-stdin, not both");
     const config = await loadOmniCodexConfig();
     const executablePath = await resolveNgrokExecutable(options.executable);
-    const tunnelConfig = { kind: "ngrok" as const, executablePath, publicUrl: options.url };
+    const secretStore = new WindowsDpapiSecretStore({
+      directory: join(omniCodexDataDirectory(), "secrets"),
+    });
+    let createdReference: string | undefined;
+    let credentialRef = options.credentialRef;
+    if (options.authtokenStdin === true) {
+      createdReference = await secretStore.put("ngrok-authtoken", await readSecretFromStdin());
+      credentialRef = createdReference;
+    }
+    const tunnelConfig = {
+      kind: "ngrok" as const,
+      executablePath,
+      publicUrl: options.url,
+      ...(credentialRef === undefined ? {} : { credentialRef }),
+    };
     const updated: OmniCodexConfig = {
       ...config,
       tunnel: tunnelConfig,
     };
-    await saveOmniCodexConfig(updated);
+    try {
+      await saveOmniCodexConfig(updated);
+      const readback = await loadOmniCodexConfig();
+      if (readback.tunnel?.kind !== "ngrok" || readback.tunnel.credentialRef !== credentialRef)
+        throw new Error("ngrok configuration authoritative readback failed");
+    } catch (error) {
+      if (createdReference !== undefined)
+        await secretStore.remove(createdReference).catch(() => undefined);
+      throw error;
+    }
+    const previousReference =
+      config.tunnel?.kind === "ngrok" ? config.tunnel.credentialRef : undefined;
+    if (
+      createdReference !== undefined &&
+      previousReference?.startsWith("dpapi:v1:") === true &&
+      previousReference !== createdReference
+    )
+      await secretStore.remove(previousReference);
     emit(
       { ok: true, tunnel: updated.tunnel, configPath: omniCodexConfigPath() },
       options.json === true,
@@ -969,6 +1005,8 @@ interface CompleteInitOptions extends Omit<InitOptions, "issuer" | "audience" | 
 interface NgrokTunnelOptions extends JsonOptions {
   readonly url: string;
   readonly executable?: string;
+  readonly credentialRef?: string;
+  readonly authtokenStdin?: boolean;
 }
 
 interface AuthSetupOptions extends JsonOptions {
@@ -1029,6 +1067,24 @@ async function completeInitOptions(options: InitOptions): Promise<CompleteInitOp
   if (audience === undefined || audience.length === 0) throw new Error("--audience is required");
   if (subject === undefined || subject.length === 0) throw new Error("--subject is required");
   return { ...options, issuer, audience, subject };
+}
+
+async function readSecretFromStdin(): Promise<string> {
+  if (process.stdin.isTTY) throw new Error("--authtoken-stdin requires piped stdin");
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.from(chunk);
+    size += bytes.length;
+    if (size > 64 * 1024) throw new Error("Secret input exceeded 64 KiB");
+    chunks.push(bytes);
+  }
+  const secret = Buffer.concat(chunks)
+    .toString("utf8")
+    .replace(/\r?\n$/, "");
+  if (secret.length < 16 || /[\r\n\0]/.test(secret))
+    throw new Error("Secret input is empty, weak, or multiline");
+  return secret;
 }
 
 async function launchDaemon(): Promise<OmniCodexDaemonState> {

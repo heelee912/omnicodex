@@ -4,11 +4,14 @@ import {
   HiddenChildProcessBoundary,
   type OwnedHiddenChildProcess,
 } from "../windows/hidden-child-process.js";
+import type { ReadableSecretReferenceStore } from "../windows/windows-dpapi-secret-store.js";
 
 export interface NgrokTunnelSupervisorOptions {
   readonly executablePath: string;
   readonly publicUrl: string;
   readonly expectedResource: string;
+  readonly credentialRef?: string;
+  readonly secretStore?: ReadableSecretReferenceStore;
   readonly startupTimeoutMs?: number;
   readonly probeIntervalMs?: number;
   readonly probe?: (url: URL, expectedResource: string) => Promise<boolean>;
@@ -23,8 +26,9 @@ export interface NgrokTunnelStatus {
 }
 
 /**
- * Owns exactly one ngrok child. Credentials stay in ngrok's protected user
- * configuration; OmniCodex never places them in arguments, logs, or state.
+ * Owns exactly one ngrok child. A credential reference is resolved from the
+ * CurrentUser DPAPI store only at spawn time and passed through ngrok's
+ * documented environment variable, never through argv, logs, or state.
  */
 export class NgrokTunnelSupervisor {
   readonly #options: Required<
@@ -66,10 +70,11 @@ export class NgrokTunnelSupervisor {
       `/.well-known/oauth-protected-resource${normalizeMcpPath(address.path)}`,
       this.#options.publicUrl,
     );
+    const environment = await this.#ngrokEnvironment();
     const child = this.#options.childProcesses.spawnHidden(
       this.#options.executablePath,
       ["http", targetUrl, "--url", this.#options.publicUrl, "--log=stdout", "--log-format=json"],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], env: environment },
     );
     this.#child = child;
     child.once("error", () => undefined);
@@ -95,6 +100,15 @@ export class NgrokTunnelSupervisor {
       await this.stop();
       throw error;
     }
+  }
+
+  async #ngrokEnvironment(): Promise<NodeJS.ProcessEnv> {
+    const reference = this.#options.credentialRef;
+    if (reference === undefined) return { ...process.env };
+    if (this.#options.secretStore === undefined)
+      throw new Error("ngrok credential reference has no secret store");
+    const authtoken = await this.#options.secretStore.get(reference);
+    return { ...process.env, NGROK_AUTHTOKEN: authtoken };
   }
 
   async stop(): Promise<void> {

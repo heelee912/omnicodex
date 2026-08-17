@@ -35,4 +35,5 @@ export * from "./infrastructure/tunnel/ngrok-tunnel-supervisor.js";
 export * from "./infrastructure/windows/codex-runtime-discovery.js";
 export * from "./infrastructure/windows/hidden-child-process.js";
 export * from "./infrastructure/windows/windows-autostart-manager.js";
+export * from "./infrastructure/windows/windows-dpapi-secret-store.js";
 export * from "./infrastructure/windows/workspace-dependency-locator.js";

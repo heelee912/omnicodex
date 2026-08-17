@@ -21,16 +21,23 @@ describe("NgrokTunnelSupervisor", () => {
   it("starts one owned hidden child and proves the public protected-resource route", async () => {
     const executablePath = await fakeExecutable();
     const child = new FakeChild();
-    const spawns: Array<{ executable: string; args: readonly string[] }> = [];
+    const spawns: Array<{ executable: string; args: readonly string[]; env?: NodeJS.ProcessEnv }> =
+      [];
     const probes: string[] = [];
-    const childProcesses = new HiddenChildProcessBoundary((executable, args) => {
-      spawns.push({ executable, args });
+    const childProcesses = new HiddenChildProcessBoundary((executable, args, options) => {
+      spawns.push({ executable, args, env: options.env as NodeJS.ProcessEnv });
       return child as never;
     });
     const tunnel = new NgrokTunnelSupervisor({
       executablePath,
       publicUrl: "https://owner.ngrok.app",
       expectedResource: "https://owner.ngrok.app/mcp",
+      credentialRef: "dpapi:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      secretStore: {
+        put: async () => "unused",
+        remove: async () => undefined,
+        get: async () => "ngrok-authtoken-kept-out-of-arguments",
+      },
       childProcesses,
       probe: async (url, expectedResource) => {
         probes.push(url.href);
@@ -58,8 +65,10 @@ describe("NgrokTunnelSupervisor", () => {
           "--log=stdout",
           "--log-format=json",
         ],
+        env: expect.objectContaining({ NGROK_AUTHTOKEN: "ngrok-authtoken-kept-out-of-arguments" }),
       },
     ]);
+    expect(JSON.stringify(spawns[0]?.args)).not.toContain("ngrok-authtoken-kept-out-of-arguments");
     expect(probes).toEqual(["https://owner.ngrok.app/.well-known/oauth-protected-resource/mcp"]);
 
     await tunnel.stop();

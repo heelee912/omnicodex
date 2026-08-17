@@ -2,6 +2,7 @@
 
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
+import { join } from "node:path";
 import { OmniCodexGatewayService } from "./application/omnicodex-gateway-service.js";
 import { OracleAdapterService } from "./application/oracle-adapter-service.js";
 import { JwtBearerAuthorizer } from "./infrastructure/auth/jwt-bearer-authorizer.js";
@@ -10,11 +11,13 @@ import {
   daemonControlPipe,
   loadOmniCodexConfig,
   type OmniCodexDaemonState,
+  omniCodexDataDirectory,
   writeOmniCodexDaemonState,
 } from "./infrastructure/config/omnicodex-config-store.js";
 import { OmniCodexOperationalLog } from "./infrastructure/operations/operational-log.js";
 import { ExternalTunnelSupervisor } from "./infrastructure/tunnel/external-tunnel-supervisor.js";
 import { NgrokTunnelSupervisor } from "./infrastructure/tunnel/ngrok-tunnel-supervisor.js";
+import { WindowsDpapiSecretStore } from "./infrastructure/windows/windows-dpapi-secret-store.js";
 
 const config = assertGatewayConfigured(await loadOmniCodexConfig());
 const controlPipe = daemonControlPipe();
@@ -93,9 +96,13 @@ try {
     if (status.address === undefined)
       throw new Error("Gateway address is unavailable for tunneling");
     if (config.tunnel.kind === "ngrok") {
+      const secretStore = new WindowsDpapiSecretStore({
+        directory: join(omniCodexDataDirectory(), "secrets"),
+      });
       tunnelSupervisor = new NgrokTunnelSupervisor({
         ...config.tunnel,
         expectedResource: config.auth.resource ?? config.auth.audience,
+        secretStore,
       });
       await tunnelSupervisor.start(status.address);
     } else if (config.tunnel.kind !== "direct") {
