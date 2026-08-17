@@ -1,0 +1,13 @@
+dist/
+node_modules/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+.omnicodex/
+.ouroboros/
+.upstream/
+--help
+*.tgz
+*.tsbuildinfo

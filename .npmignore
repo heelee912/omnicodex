@@ -1,0 +1,9 @@
+src/
+test/
+.github/
+.agents/
+vitest.config.ts
+tsconfig.json
+tsconfig.build.json
+biome.json
+PRD.md

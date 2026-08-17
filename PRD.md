@@ -167,6 +167,21 @@ or security requirements.
 The words **must**, **never**, **only**, **before**, **after**, **exactly**, and
 **without** are structural requirements.
 
+### 6.1 Optional first-class ChatGPT consent companion
+
+The package includes an optional ChatGPT-web consent companion. It may attach
+only to an explicitly configured HTTP loopback CDP endpoint and never launches,
+terminates, or profiles Chrome. A watch is strongly bound to the exact ChatGPT
+connector ID/name, Oracle run ID, session/correlation IDs, and MCP resource and
+surface. Only Connect and Always allow are eligible; one-time allowance, generic
+confirmation, settings, registration, disconnect, removal, and deletion are never
+clicked. Reconnect, stale run/session/DOM, ambiguous controls, and unverifiable
+post-action state fail closed. Selection uses accessible role/name first with a
+bounded classified fallback. Metadata-only receipts contain timestamp, bound IDs,
+selector class, and before/after hashes, never screenshots, prompts, secrets, or
+raw page/tool content. Timeout, cancellation, polling, and retry are bounded. The
+entrypoint must not register OmniCodex MCP into the local Codex application.
+
 ## 7. Bounded contexts and ownership
 
 | Bounded context | Owned decisions |
@@ -324,6 +339,17 @@ protocol violation. The call fails and the executor enters `FAULTED` until
 re-probed.
 
 ## 10. Runtime and executor state machines
+
+### 10.0 Absolute no-visible-console invariant
+
+OmniCodex must never open a foreground Command Prompt, PowerShell, Windows
+Terminal, or other console window on the user's desktop. This is an absolute
+product invariant for initialization, normal operation, recovery, updates,
+tunnels, diagnostics, and autostart. Every owned console child uses hidden/no
+window process creation. Interactive status and logs are shown only inside the
+terminal from which the user explicitly invoked a CLI command; unattended
+operation never creates a new visible terminal. A dependency that cannot run
+without creating a foreground console is incompatible and must not be launched.
 
 ### 10.1 Primary runtime state machine
 
@@ -824,9 +850,24 @@ Every eligible child or thread is launched with `approval_policy=never` and
 protocol still emits an approval request, the gateway selects the strongest
 affirmative response represented by that protocol.
 
-The gateway does not synthesize UI clicks and does not weaken managed policy.
-An OS or enterprise denial returns `POLICY_BLOCKED`. An approval shape that
-cannot be interpreted safely also returns `POLICY_BLOCKED`.
+Approval has two distinct enforcement layers:
+
+1. The host-runtime layer is owned by the gateway. It answers the installed
+   App Server's documented command, file-change, legacy, and permission
+   approval requests with the strongest affirmative response supported by the
+   advertised schema (`acceptForSession`, `approved_for_session`, or a
+   session-scoped requested permission grant).
+2. A remote MCP client may independently show its own confirmation UI. The
+   server cannot suppress that UI. For the supported ChatGPT-web distribution
+   path, OmniCodex therefore includes an app-name-scoped companion approval
+   adapter derived from the proven CodexPro automation behavior. It selects
+   “remember in this conversation” and the strongest visible affirmative
+   action for OmniCodex dialogs only. Other MCP clients need an equivalent
+   client-side policy or adapter.
+
+Neither layer weakens managed policy. An OS or enterprise denial returns
+`POLICY_BLOCKED`. An approval shape that cannot be interpreted safely also
+returns `POLICY_BLOCKED`; it is never guessed or treated as user input.
 
 ## 19. OAuth and Auth0 security contract
 
@@ -1052,7 +1093,7 @@ Common exit codes are:
 
 | Command | Exact default behavior |
 | --- | --- |
-| `npx omnicodex init` | Runs the setup wizard. It creates OmniCodex-owned directories, writes non-secret config, creates an installation ID, configures Auth0, selects ngrok, and runs local non-runtime diagnostics. It does not start a Codex child until the non-interference guard exists and passes. |
+| `npx @heelee912/omnicodex init` | Runs the setup wizard. It creates OmniCodex-owned directories, writes non-secret config, creates an installation ID, configures Auth0, selects ngrok, and runs local non-runtime diagnostics. It does not start a Codex child until the non-interference guard exists and passes. |
 | `omnicodex start` | Acquires the user lock, validates config and secrets, takes the guard snapshot, starts OmniCodex children, then starts the selected adapter. Repeating it against a healthy process succeeds without starting another process. |
 | `omnicodex stop` | Stops admission, drains under the update rules, stops only OmniCodex-owned children and adapter, and releases the lock. It never targets the desktop app. |
 | `omnicodex restart` | Performs `stop` and `start` while preserving validated config and state. It aborts if a non-replayable write cannot drain. |

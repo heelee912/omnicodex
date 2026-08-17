@@ -1,0 +1,11 @@
+OmniCodex
+Copyright (c) 2026 heelee912
+
+This distribution is licensed under the MIT License in LICENSE.
+
+Behavior and tests were independently informed by the pinned sources documented
+in docs/reference-ledger.md. In particular, Codex Web GPT Automation / codexpro-
+automation is MIT licensed, copyright (c) 2026 ventianima-lab. No Oracle,
+DevSpace, Codex, Chrome, ngrok, or other third-party binary is redistributed.
+OpenAI, ChatGPT, and Codex are trademarks of their respective owner. OmniCodex
+is a community project and is not endorsed by OpenAI.
