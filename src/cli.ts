@@ -23,6 +23,7 @@ import {
 import {
   assertGatewayConfigured,
   loadOmniCodexConfig,
+  loadOptionalOmniCodexConfig,
   mergeGatewayInitialization,
   type OmniCodexConfig,
   type OmniCodexDaemonState,
@@ -120,7 +121,7 @@ program
         ...(answers.jwksUri === undefined ? {} : { jwksUri: answers.jwksUri }),
       },
     };
-    const existingConfig = (await configExists()) ? await loadOmniCodexConfig() : undefined;
+    const existingConfig = await loadOptionalOmniCodexConfig();
     const config = mergeGatewayInitialization(nextConfig, existingConfig);
     await saveOmniCodexConfig(config);
     emit(

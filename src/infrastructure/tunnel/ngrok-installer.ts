@@ -1,13 +1,5 @@
 import { createHash } from "node:crypto";
-import {
-  access,
-  copyFile,
-  mkdir,
-  mkdtemp,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { type Auth0CliCommand, executeAuth0CliHidden } from "../auth/auth0-cli.js";

@@ -127,6 +127,19 @@ export async function loadOmniCodexConfig(path = omniCodexConfigPath()): Promise
   return validateConfig(parsed);
 }
 
+export async function loadOptionalOmniCodexConfig(
+  path = omniCodexConfigPath(),
+): Promise<OmniCodexConfig | undefined> {
+  try {
+    return await loadOmniCodexConfig(path);
+  } catch (error) {
+    if (getErrorCode(error) === "ENOENT" || String(error).includes("is not initialized; missing")) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 export function assertGatewayConfigured(config: OmniCodexConfig): OmniCodexConfig {
   if (config.companionOnly === true) {
     throw new Error(

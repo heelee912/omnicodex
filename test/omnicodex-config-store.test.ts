@@ -1,9 +1,10 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   loadOmniCodexConfig,
+  loadOptionalOmniCodexConfig,
   mergeGatewayInitialization,
   type OmniCodexConfig,
   omniCodexDataDirectory,
@@ -49,6 +50,15 @@ describe("OmniCodex config store", () => {
     };
     await writeOmniCodexDaemonState(state, statePath);
     await expect(readOmniCodexDaemonState(statePath)).resolves.toEqual(state);
+  });
+
+  it("treats only a missing config as optional and rejects malformed state", async () => {
+    const directory = await makeTemporaryDirectory();
+    const configPath = join(directory, "config.json");
+    await expect(loadOptionalOmniCodexConfig(configPath)).resolves.toBeUndefined();
+
+    await writeFile(configPath, "{not-json", "utf8");
+    await expect(loadOptionalOmniCodexConfig(configPath)).rejects.toBeInstanceOf(SyntaxError);
   });
 
   it("fails closed for a non-loopback bind or missing owner subject", async () => {
