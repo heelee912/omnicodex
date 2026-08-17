@@ -618,9 +618,10 @@ auth
   .option("--json", "emit machine-readable JSON after login completes")
   .action(async (options: AuthLoginOptions) => {
     await requireStoppedDaemon();
-    const config = await loadOmniCodexConfig();
+    const config = await loadOptionalOmniCodexConfig();
     const tenant =
-      options.tenant ?? (config.auth.issuer.length === 0 ? undefined : config.auth.issuer);
+      options.tenant ??
+      (config === undefined || config.auth.issuer.length === 0 ? undefined : config.auth.issuer);
     const executable = await new Auth0CliInstaller({
       dataDirectory: omniCodexDataDirectory(),
     }).ensure(options.auth0Cli);
