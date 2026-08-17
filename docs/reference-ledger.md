@@ -322,8 +322,26 @@ supervisor, browser-profile lifecycle, app registration, or generic confirmation
 automation. The companion binds the exact connector ID/name, Oracle run/session,
 correlation ID, MCP resource, and MCP surface; stale identity or DOM fails closed.
 
-The non-secret successful reference run `20260816T063703Z-b6f30c4c2826` used app
-`DevSpace-AutoApproval-E2E-20260816` and session
-`oracle-codexpro-automation-b6f30c4c28`. This proves the reference workflow, not
-OmniCodex. A fresh OmniCodex live rerun remains pending. No Chrome, Codex, OCI,
-network, or process operation was performed during this adoption.
+The original project's setup responsibility was also verified in code and in
+the live UI: `AppConnector.reconcile()` calls
+`_connect_and_maximize_permission()` for the exact app, selects the maximum
+`Allow all actions` / `모든 액션 허용` setting, and reads the selected state
+back before accepting the reconciliation. The Oracle prompt watcher is the
+second line for first-use `Connect` and `Always allow` sheets; it is not the
+only auto-approval mechanism.
+
+The dedicated app `OmniCodex-AutoApproval-E2E-20260817` was reconciled through
+that exact path and independently read back as `connected=true` and
+`full_access=true`. A fresh Oracle run
+`3c563b292d7442f8bd6a5cb05c1f2630` then verified GPT-5.6 Sol selection,
+Power 5/5, and successful selected-app `ls` and `read` calls without sending an
+absolute Windows path. It completed terminally with exit code 0 and
+`TASK_OUTCOME: EXECUTED`; output SHA-256 is
+`07d656f4f107490ef8741a680c95d92224f765cd32a50488e812ecd519ea8d03`.
+
+That live flow exposed and fixed two bounded reference defects: a sole
+connector-owned `about:blank` tab may be promoted to the settings utility only
+after exact target/URL readback, and closing a sole owned utility tab first
+requires a distinct verified replacement tab. Conversation targets remain
+foreign and fail closed. The focused reference suite passes 35 tests and the
+verified source bytes were synchronized to the installed automation copy.
