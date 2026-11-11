@@ -20,7 +20,7 @@ jobs:
           $env:TEMP = $env:RUNNER_TEMP
           $env:TMP = $env:RUNNER_TEMP
           $env:TMPDIR = $env:RUNNER_TEMP
-          npm test
+          npm test -- --maxWorkers=2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Assert no user app lane
         shell: pwsh
