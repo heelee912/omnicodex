@@ -8,11 +8,10 @@ OmniCodex는 설치된 Codex 런타임의 실제 도구를 owner 인증 MCP로 �
 전용 데스크톱 수명주기 도구를 사용합니다.
 Codex 인증·설정 파일은 변경하지 않으며 로컬 Codex 앱에 OmniCodex MCP를 등록하지 않습니다.
 
-이 소스 저장소와 scoped npm 패키지는 공개 배포를 위한 것입니다. npm에서
-`@heelee912/omnicodex` 버전 `0.1.0`이 조회되면 전역 설치할 수 있고, 아직
-조회되지 않으면 공개 소스를 빌드할 수 있습니다. 각 설치자는 자신의 Auth0
-애플리케이션·API와 HTTPS 터널·계정을 설정해야 하며 다른 사용자의 설정이나
-자격 파일을 복사하면 안 됩니다.
+이 소스와 `v0.1.0` GitHub Release tarball은 공개 배포용입니다. npm
+레지스트리 계정 없이 tarball을 다운로드하고 해시를 확인한 뒤 npm CLI로 설치할 수
+있습니다. 각 설치자는 자신의 Auth0 애플리케이션·API와 HTTPS 터널·계정을
+설정해야 하며 다른 사용자의 설정이나 자격 파일을 복사하면 안 됩니다.
 
 필수 환경은 Windows, Node.js 24.14.0 이상, Git(소스 설치 시)과 로그인한
 Codex 데스크톱입니다. 아래 PowerShell 명령은 각 설치 방식에 맞춰 실행합니다.
@@ -24,15 +23,24 @@ Codex 데스크톱입니다. 아래 PowerShell 명령은 각 설치 방식에 �
 
 다음 순서를 건너뛰지 않습니다.
 
-1. npm에서 버전을 확인하고 공개 패키지를 설치합니다.
+1. GitHub Release tarball과 체크섬을 다운로드·검증한 뒤 설치합니다.
 
    ```powershell
-   npm view @heelee912/omnicodex version
-   npm install --global @heelee912/omnicodex --ignore-scripts
+   $base = 'https://github.com/heelee912/omnicodex/releases/download/v0.1.0'
+   $file = 'heelee912-omnicodex-0.1.0.tgz'
+   Invoke-WebRequest "$base/$file" -OutFile $file
+   Invoke-WebRequest "$base/$file.sha256" -OutFile "$file.sha256"
+   $checksum = (Get-Content "$file.sha256" -Raw).Trim()
+   if ($checksum -notmatch '^([0-9a-fA-F]{64})\s+heelee912-omnicodex-0\.1\.0\.tgz$' -or
+       (Get-FileHash $file -Algorithm SHA256).Hash -ne $Matches[1]) {
+     throw 'Release tarball checksum mismatch'
+   }
+   npm install --global ".\$file" --ignore-scripts
+   omnicodex --help
    ```
 
-   레지스트리에 아직 버전이 없다면 공개 소스를 체크아웃하고 빌드합니다.
-   기존 변경을 초기화하거나 다른 체크아웃으로 덮어쓰지 않습니다.
+   또는 공개 소스를 체크아웃하고 빌드합니다. 기존 변경을 초기화하거나
+   다른 체크아웃으로 덮어쓰지 않습니다.
 
    ```powershell
    git clone 'https://github.com/heelee912/omnicodex.git' OmniCodex

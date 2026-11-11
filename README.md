@@ -63,12 +63,22 @@ data into a package.
 
 1. Install and initialize the owner-only gateway.
 
-   When `npm view @heelee912/omnicodex version` reports `0.1.0`, install the
-   public scoped package:
+   Download the `v0.1.0` tarball and its checksum from GitHub Releases, verify
+   the exact file, then install it with npm. An npm publisher account is not
+   required for this local-tarball installation.
 
    ```powershell
-   npm view @heelee912/omnicodex version
-   npm install --global @heelee912/omnicodex --ignore-scripts
+   $base = 'https://github.com/heelee912/omnicodex/releases/download/v0.1.0'
+   $file = 'heelee912-omnicodex-0.1.0.tgz'
+   Invoke-WebRequest "$base/$file" -OutFile $file
+   Invoke-WebRequest "$base/$file.sha256" -OutFile "$file.sha256"
+   $checksum = (Get-Content "$file.sha256" -Raw).Trim()
+   if ($checksum -notmatch '^([0-9a-fA-F]{64})\s+heelee912-omnicodex-0\.1\.0\.tgz$' -or
+       (Get-FileHash $file -Algorithm SHA256).Hash -ne $Matches[1]) {
+     throw 'Release tarball checksum mismatch'
+   }
+   npm install --global ".\$file" --ignore-scripts
+   omnicodex --help
    ```
 
    Alternatively, build the same public source checkout:
@@ -191,6 +201,10 @@ omnicodex auth cleanup-dcr --client-id EXACT_ID --fingerprint EXACT_SHA256 --exe
 ```
 
 ## Package update and rollback
+
+The `update` and `rollback` commands below require an npm-registry release and
+its registry provenance. They do not consume this GitHub Release tarball; for
+`v0.1.0`, download and install the verified tarball as shown above instead.
 
 `update` no longer renames an arbitrary caller-supplied directory. It installs
 one exact npm version without lifecycle scripts and requires the exact lowercase
