@@ -6,12 +6,13 @@ OmniCodex は、インストール済み Codex ランタイムの実際のツー
 明示的に依頼された作業では、ランタイムのネイティブ Computer Use とデスクトップ
 ツールを利用でき、アプリの起動・再起動には専用のライフサイクルツールを使用します。
 Codex の認証・設定は変更せず、ローカル Codex に OmniCodex MCP を登録しません。
-このソースリポジトリは公開されていますが、npm パッケージは未公開で
-`package.json` は `private: true` です。Windows、Node.js 24.14.0 以降、
-Git、サインイン済みの Codex Desktop を用意し、公開リポジトリを clone して
-`npm ci --ignore-scripts`、`npm run build`、`node dist/cli.js init --help` の
-順に進めてください。各利用者は自分の Auth0 アプリ・API、HTTPS トンネル、
-Codex/ChatGPT アカウントを設定します。個人の認証情報は同梱されません。
+このソースと scoped npm パッケージは公開配布用です。Windows、Node.js
+24.14.0 以降、サインイン済みの Codex Desktop を用意し、npm で `0.1.0`
+の公開を確認して `npm install --global @heelee912/omnicodex --ignore-scripts`
+を実行してください。未公開の場合はソースを clone して
+`npm ci --ignore-scripts` と `npm run build` を実行します。各利用者は自分の
+Auth0 アプリ・API、HTTPS トンネル、Codex/ChatGPT アカウントを設定します。
+個人の認証情報はパッケージに含まれません。
 OmniCodex2 の任意の hosted コネクタは
 [セットアップガイド](../scripts/connectors/hosted-mcp/README.md)を参照してください。
 詳細な手順と安全境界は[英語 README](../README.md)と

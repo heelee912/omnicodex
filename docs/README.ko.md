@@ -8,13 +8,14 @@ OmniCodex는 설치된 Codex 런타임의 실제 도구를 owner 인증 MCP로 �
 전용 데스크톱 수명주기 도구를 사용합니다.
 Codex 인증·설정 파일은 변경하지 않으며 로컬 Codex 앱에 OmniCodex MCP를 등록하지 않습니다.
 
-이 소스 저장소는 공개되어 있지만 `package.json`은 `private: true`이며 npm 패키지는
-아직 게시되지 않았습니다. 아래 설치는 공개 소스 체크아웃을 사용합니다. 각 설치자는
-자신의 Auth0 애플리케이션·API와 HTTPS 터널·계정을 설정해야 하며 다른 사용자의
-설정이나 자격 파일을 복사하면 안 됩니다.
+이 소스 저장소와 scoped npm 패키지는 공개 배포를 위한 것입니다. npm에서
+`@heelee912/omnicodex` 버전 `0.1.0`이 조회되면 전역 설치할 수 있고, 아직
+조회되지 않으면 공개 소스를 빌드할 수 있습니다. 각 설치자는 자신의 Auth0
+애플리케이션·API와 HTTPS 터널·계정을 설정해야 하며 다른 사용자의 설정이나
+자격 파일을 복사하면 안 됩니다.
 
-필수 환경은 Windows, Node.js 24.14.0 이상, Git과 로그인한 Codex 데스크톱입니다.
-아래 PowerShell 명령은 소스 작업 폴더에서 실행합니다.
+필수 환경은 Windows, Node.js 24.14.0 이상, Git(소스 설치 시)과 로그인한
+Codex 데스크톱입니다. 아래 PowerShell 명령은 각 설치 방식에 맞춰 실행합니다.
 `<...>`는 실행 전에 운영 환경에서 확인한 값으로 바꾸는 자리표시자입니다. 서버 주소,
 계정 식별자와 자격 증명을 문서에 기록하지 마십시오. 각 명령의 종료 코드가 0인지
 확인하고 실패하면 다음 명령으로 넘어가지 않습니다.
@@ -23,19 +24,25 @@ Codex 인증·설정 파일은 변경하지 않으며 로컬 Codex 앱에 OmniCo
 
 다음 순서를 건너뛰지 않습니다.
 
-1. 공개 소스 저장소를 체크아웃하고 빌드합니다. 이미 작업 중인 체크아웃이 있으면
-   clone과 폴더 이동을 생략합니다. 기존 변경을 초기화하거나 다른 체크아웃으로
-   덮어쓰지 않습니다. 저장소 URL에는 토큰을 삽입하지 않습니다.
+1. npm에서 버전을 확인하고 공개 패키지를 설치합니다.
+
+   ```powershell
+   npm view @heelee912/omnicodex version
+   npm install --global @heelee912/omnicodex --ignore-scripts
+   ```
+
+   레지스트리에 아직 버전이 없다면 공개 소스를 체크아웃하고 빌드합니다.
+   기존 변경을 초기화하거나 다른 체크아웃으로 덮어쓰지 않습니다.
 
    ```powershell
    git clone 'https://github.com/heelee912/omnicodex.git' OmniCodex
    Set-Location .\OmniCodex
    npm ci --ignore-scripts
    npm run build
-   node dist/cli.js --help
    ```
 
-   이후 예시도 전역 명령 대신 `node dist/cli.js`를 사용합니다.
+   아래 `node dist/cli.js` 예시는 소스 설치 기준입니다. npm 전역 설치자는
+   같은 명령을 `omnicodex`로 실행합니다.
 2. Auth0 issuer, 전용 API audience, `/mcp/full` OAuth resource, 허용할 owner `sub`와
    Chat origin을 확인해 저장합니다. 아래 일반 gateway 초기화는 즉시 설정을 저장합니다.
    `init --local-only`는 보조 기능만 초기화하므로 gateway 설치를 대신하지 않습니다.

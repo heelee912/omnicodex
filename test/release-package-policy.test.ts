@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 const root = new URL("../", import.meta.url);
 describe("release package policy", () => {
-  it("keeps local packages private with an explicit file allowlist", async () => {
+  it("publishes a scoped public package with an explicit file allowlist", async () => {
     const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8")) as Record<
       string,
       unknown
@@ -13,9 +13,9 @@ describe("release package policy", () => {
       license: "MIT",
       engines: { node: ">=24.14.0" },
       bin: { omnicodex: "./dist/cli.js" },
-      private: true,
+      private: false,
+      publishConfig: { access: "public" },
     });
-    expect(pkg.publishConfig).toBeUndefined();
     expect(pkg.files).toEqual([
       "dist",
       "docs/README.ko.md",

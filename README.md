@@ -63,22 +63,26 @@ data into a package.
 
 1. Install and initialize the owner-only gateway.
 
-   The npm package is not published. Use this public source checkout until a
-   separately verified registry release exists:
+   When `npm view @heelee912/omnicodex version` reports `0.1.0`, install the
+   public scoped package:
+
+   ```powershell
+   npm view @heelee912/omnicodex version
+   npm install --global @heelee912/omnicodex --ignore-scripts
+   ```
+
+   Alternatively, build the same public source checkout:
 
    ```powershell
    git clone https://github.com/heelee912/omnicodex.git
    Set-Location omnicodex
    npm ci --ignore-scripts
    npm run build
-   node dist/cli.js init --help
    ```
 
-   Only after a separately verified npm release is actually published, the
-   registry install path will be:
+   Initialize with **your own** Auth0 issuer, owner, and HTTPS origin:
 
    ```powershell
-   npm install --global @heelee912/omnicodex --ignore-scripts
    omnicodex init `
      --issuer https://YOUR_TENANT.us.auth0.com/ `
      --audience https://YOUR_PUBLIC_ORIGIN/mcp/full `
@@ -88,8 +92,8 @@ data into a package.
      --port 8787
    ```
 
-   When running from source, replace `omnicodex` in the remaining commands with
-   `node dist/cli.js`.
+   From a source checkout, use `node dist/cli.js` instead of `omnicodex` in
+   the remaining commands.
 
 2. Complete the official Auth0 device login, including tenant MFA when Auth0
    requests it, then provision the dedicated resource server and strict DCR
@@ -336,22 +340,18 @@ private historical issue/PRD documents, local sessions and attachments, and the
 former private repository's branches, tags, releases and Actions history. The
 private archive is not part of this public repository.
 
-The npm package remains `private: true` and unpublished. Its explicit file
-allowlist includes runtime code and public setup documentation, not local
-configuration, credentials or generated data. Audit
-`npm pack --dry-run --ignore-scripts --json` on a clean checkout before any
-separately authorized npm release. Maintainers run `npm run check` and
-`npm run build`; a GitHub source release does not publish to npm.
+The npm package is configured as a public scoped release, with an explicit file
+allowlist for runtime code and setup documentation. It excludes local config,
+credentials, historical documents, and session/attachment data. Before each
+release, maintainers run `npm run check`, `npm run build`, inspect the actual
+`npm pack --dry-run --ignore-scripts --json` contents, scan the packed bytes for
+secrets, and audit production dependencies. This verifies the distributable
+code; it does **not** require the publisher to provision every recipient's
+Auth0 tenant, OAuth client, HTTPS tunnel, or installed Codex tools. Those are
+per-user setup steps described above and in the OmniCodex2 guided installer.
 
-For a future npm release, the protected acceptance process requires one
-`release-acceptance.json`
-artifact whose actual gates all bind the same GitHub commit, package version,
-and packed SHA-256. Candidate and released acceptance can be inspected with
-`omnicodex acceptance status` and fail-closed with `omnicodex acceptance verify`.
-After a real gate succeeds, `omnicodex acceptance record --gate NAME
---source-commit SHA --package-version X.Y.Z --package-sha256 DIGEST --artifact
-kind=C:\absolute\result.json --execute` stores only the artifact kind, byte
-size, and SHA-256. It is dry-run by default, refuses cross-build mixing, and
-does not overwrite different evidence for an already recorded gate.
+The `omnicodex acceptance` commands remain available for deployments that
+choose managed, same-build provenance evidence; they are not a prerequisite
+for a source or npm package installation.
 
 MIT licensed. This community project is not an official OpenAI product.

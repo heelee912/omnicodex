@@ -1,7 +1,10 @@
 {
   "name": "@heelee912/omnicodex",
-  "version": "0.0.0-development",
-  "private": true,
+  "version": "0.1.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Expose the installed Codex native tool surface as an authenticated remote MCP without model delegation.",
   "type": "module",
   "bin": {
