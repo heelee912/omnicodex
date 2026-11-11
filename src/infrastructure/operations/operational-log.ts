@@ -355,10 +355,17 @@ export class OmniCodexOperationalLog {
     }
     if (size < this.#maxBytes) return undefined;
     await mkdir(this.#archiveDirectory, { recursive: true });
+    // Two rotations can share one millisecond. Preserve append order even when
+    // their file identities sort in the opposite lexical order on Windows.
+    let archiveOrder = Date.now();
+    for (const name of await readdir(this.#archiveDirectory)) {
+      const match = ARCHIVE_FILE_PATTERN.exec(name);
+      if (match?.[1] !== undefined) archiveOrder = Math.max(archiveOrder, Number(match[1]) + 1);
+    }
     const currentStats = await stat(this.#path);
     const rotated = join(
       this.#archiveDirectory,
-      `segment-${Date.now().toString().padStart(13, "0")}-${process.pid.toString(16)}--${fileIdentity(currentStats)}.jsonl`,
+      `segment-${archiveOrder.toString().padStart(13, "0")}-${process.pid.toString(16)}--${fileIdentity(currentStats)}.jsonl`,
     );
     try {
       await rename(this.#path, rotated);

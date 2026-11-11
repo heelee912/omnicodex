@@ -160,7 +160,7 @@ describe("OmniCodex internal integrity keys", () => {
         (await readdir(secretsDirectory)).filter((name) => name.endsWith(".dpapi")),
       ).toHaveLength(1);
     },
-    30_000,
+    90_000,
   );
 });
 

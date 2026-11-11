@@ -1,7 +1,7 @@
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OmniCodexOperationalLog } from "../src/infrastructure/operations/operational-log.js";
 
 const temporaryDirectories: string[] = [];
@@ -140,8 +140,18 @@ describe("OmniCodexOperationalLog", () => {
     });
     await log.append("daemon_starting");
     const cursor = await log.captureCursor();
-    await log.append("daemon_ready", { port: 9519 });
-    await log.append("daemon_stopping");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    try {
+      await log.append("daemon_ready", { port: 9519 });
+      await log.append("daemon_stopping");
+    } finally {
+      clock.mockRestore();
+    }
+    const orders = (await readdir(`${log.path}.segments`)).map(
+      (name) => /^segment-(\d{13})/u.exec(name)?.[1],
+    );
+    expect(orders).toHaveLength(2);
+    expect(new Set(orders).size).toBe(2);
 
     const batch = await log.readFrom(cursor);
     expect(batch.entries).toMatchObject([
