@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertConfig } from "./config.mjs";
+import { windowsAclFailureKind } from "./config-store.mjs";
 
 const packageRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const states = new WeakSet();
@@ -32,6 +33,7 @@ async function verifyWindowsStateDirectory(directory, operation) {
     throw new Error("Windows private state protection is unavailable.");
   }
   await new Promise((resolve, reject) => {
+    let diagnostic = "";
     const child = spawn(
       join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
       [
@@ -51,13 +53,19 @@ async function verifyWindowsStateDirectory(directory, operation) {
         signal: AbortSignal.timeout(15_000),
       },
     );
-    child.stderr.resume();
+    child.stderr.on("data", (chunk) => {
+      diagnostic = `${diagnostic}${String(chunk)}`.slice(-2048);
+    });
     child.stdin.on("error", () => {});
     child.on("error", () => reject(new Error("Windows private state protection failed.")));
     child.on("close", (code) =>
       code === 0
         ? resolve()
-        : reject(new Error("Windows state directory ACL is not private to the current user.")),
+        : reject(
+            new Error(
+              `Windows state directory ACL is not private to the current user (${windowsAclFailureKind(diagnostic)}).`,
+            ),
+          ),
     );
     child.stdin.end(directory);
   });

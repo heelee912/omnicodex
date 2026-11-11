@@ -112,12 +112,28 @@ async function verifyDirectory(directory, create = false) {
   privateInfo(await lstat(directory), true);
 }
 
+export function windowsAclFailureKind(stderr) {
+  const value = String(stderr);
+  const kind = /Access is denied|UnauthorizedAccessException|permission denied/iu.test(value)
+    ? "access_denied"
+    : /Cannot find path|ItemNotFoundException/iu.test(value)
+      ? "path_missing"
+      : /Set-Acl|SetSecurityInfo/iu.test(value)
+        ? "set_acl_failed"
+        : /Get-Acl|GetSecurityInfo/iu.test(value)
+          ? "get_acl_failed"
+          : "other";
+  const id = /FullyQualifiedErrorId\s*:\s*([A-Za-z][A-Za-z0-9_.-]{0,79})/iu.exec(value)?.[1];
+  return id === undefined ? kind : `${kind}:${id}`;
+}
+
 async function privateWindowsConfig(path, operation) {
   if (process.platform !== "win32") return;
   if (!process.env.SystemRoot || !isAbsolute(process.env.SystemRoot)) {
     throw new Error("Windows private configuration protection is unavailable.");
   }
   await new Promise((resolve, reject) => {
+    let diagnostic = "";
     const child = spawn(
       join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
       [
@@ -137,13 +153,19 @@ async function privateWindowsConfig(path, operation) {
         signal: AbortSignal.timeout(15_000),
       },
     );
-    child.stderr.resume();
+    child.stderr.on("data", (chunk) => {
+      diagnostic = `${diagnostic}${String(chunk)}`.slice(-2048);
+    });
     child.stdin.on("error", () => {});
     child.on("error", () => reject(new Error("Windows private configuration protection failed.")));
     child.on("close", (code) =>
       code === 0
         ? resolve()
-        : reject(new Error("Windows configuration ACL is not private to the current user.")),
+        : reject(
+            new Error(
+              `Windows configuration ACL is not private to the current user (${windowsAclFailureKind(diagnostic)}).`,
+            ),
+          ),
     );
     child.stdin.end(path);
   });
@@ -187,8 +209,10 @@ export async function installConfig(config, options = {}) {
   } catch (error) {
     if (error.code === "EEXIST")
       throw new Error("An installed configuration already exists; it was not overwritten.");
+    const kind =
+      error instanceof Error ? /\(([A-Za-z0-9_.:-]{1,100})\)/u.exec(error.message)?.[1] : undefined;
     throw new Error(
-      "Installed configuration could not be saved privately; no fallback location was used.",
+      `Installed configuration could not be saved privately; no fallback location was used${kind === undefined ? "." : ` (${kind}).`}`,
     );
   } finally {
     await file?.close();
