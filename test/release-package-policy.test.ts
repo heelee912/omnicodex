@@ -11,7 +11,7 @@ describe("release package policy", () => {
     expect(pkg).toMatchObject({
       name: "@heelee912/omnicodex",
       license: "MIT",
-      engines: { node: ">=22.12.0" },
+      engines: { node: ">=24.14.0" },
       bin: { omnicodex: "./dist/cli.js" },
       private: true,
     });

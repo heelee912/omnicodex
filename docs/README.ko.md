@@ -8,12 +8,13 @@ OmniCodex는 설치된 Codex 런타임의 실제 도구를 owner 인증 MCP로 �
 전용 데스크톱 수명주기 도구를 사용합니다.
 Codex 인증·설정 파일은 변경하지 않으며 로컬 Codex 앱에 OmniCodex MCP를 등록하지 않습니다.
 
-현재 저장소는 비공개이며 `package.json`은 `private: true`입니다. 설치는 접근 권한이
-있는 비공개 소스 체크아웃을 기준으로 합니다. 공개 npm 패키지 조회나 전역 설치를
-설치 전제로 삼지 않으며, 저장소 공개 또는 패키지 게시를 요구하지 않습니다.
+이 소스 저장소는 공개되어 있지만 `package.json`은 `private: true`이며 npm 패키지는
+아직 게시되지 않았습니다. 아래 설치는 공개 소스 체크아웃을 사용합니다. 각 설치자는
+자신의 Auth0 애플리케이션·API와 HTTPS 터널·계정을 설정해야 하며 다른 사용자의
+설정이나 자격 파일을 복사하면 안 됩니다.
 
-필수 환경은 Windows, Node.js 22.12.0 이상, Git, 설치된 Codex 런타임 및 비공개
-저장소 접근 권한입니다. 아래 PowerShell 명령은 해당 소스의 작업 폴더에서 실행합니다.
+필수 환경은 Windows, Node.js 24.14.0 이상, Git과 로그인한 Codex 데스크톱입니다.
+아래 PowerShell 명령은 소스 작업 폴더에서 실행합니다.
 `<...>`는 실행 전에 운영 환경에서 확인한 값으로 바꾸는 자리표시자입니다. 서버 주소,
 계정 식별자와 자격 증명을 문서에 기록하지 마십시오. 각 명령의 종료 코드가 0인지
 확인하고 실패하면 다음 명령으로 넘어가지 않습니다.
@@ -22,12 +23,12 @@ Codex 인증·설정 파일은 변경하지 않으며 로컬 Codex 앱에 OmniCo
 
 다음 순서를 건너뛰지 않습니다.
 
-1. 권한이 있는 비공개 저장소를 체크아웃하고 빌드합니다. 이미 작업 중인 체크아웃이
-   있으면 clone과 새 폴더 이동을 생략하고 그 폴더를 사용합니다. 기존 변경을 초기화하거나
-   다른 체크아웃으로 덮어쓰지 않습니다. 저장소 URL에는 토큰을 삽입하지 않습니다.
+1. 공개 소스 저장소를 체크아웃하고 빌드합니다. 이미 작업 중인 체크아웃이 있으면
+   clone과 폴더 이동을 생략합니다. 기존 변경을 초기화하거나 다른 체크아웃으로
+   덮어쓰지 않습니다. 저장소 URL에는 토큰을 삽입하지 않습니다.
 
    ```powershell
-   git clone '<PRIVATE_REPOSITORY_URL>' OmniCodex
+   git clone 'https://github.com/heelee912/omnicodex.git' OmniCodex
    Set-Location .\OmniCodex
    npm ci --ignore-scripts
    npm run build
@@ -307,7 +308,7 @@ node dist/cli.js auth cleanup-dcr `
 
 ## 별도 패키지 릴리스의 업데이트·검증
 
-현재 비공개 소스 설치의 갱신은 위의 빌드·restart 절차를 사용합니다. CLI의 `update`는
+현재 공개 소스 설치의 갱신은 위의 빌드·restart 절차를 사용합니다. CLI의 `update`는
 정확한 npm 릴리스가 별도로 존재할 때만 사용하는 경로이며 소스 체크아웃 갱신을 대신하지
 않습니다. `rollback`도 이미 보관된 패키지 릴리스가 전제입니다. 아래 안내는 해당
 릴리스가 실제 준비된 경우에만 적용하며 설치를 위해 공개 배포를 요구하지 않습니다.
@@ -343,5 +344,5 @@ status는 조회 명령입니다. 위의 클라이언트별 전체 명령을 사
 explicit loopback CDP에만 attach하고 exact `Connect`와 `항상 허용` 외에는
 클릭하지 않습니다. Chrome을 시작·프로필 변경·종료하지 않고, 무관한 탭을 이동하지도
 않습니다. 설정 조정이 필요하면 보조 기능이 소유한 exact 앱 설정 target만 열고
-이동합니다. 보안 구조와 채택 근거는 [PRD](../PRD.md)와
+이동합니다. 보안 구조와 채택 근거는 [영문 README](../README.md)와
 [reference ledger](reference-ledger.md)를 참조하십시오.

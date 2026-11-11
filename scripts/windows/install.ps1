@@ -2,7 +2,9 @@
 [CmdletBinding(SupportsShouldProcess)] param()
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 or newer is required.' }
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js 22.12 or newer is required.' }
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js 24.14.0 or newer is required.' }
+$nodeVersion = [version](& node -p 'process.versions.node')
+if ($nodeVersion -lt [version]'24.14.0') { throw 'Node.js 24.14.0 or newer is required.' }
 if ($PSCmdlet.ShouldProcess('omnicodex', 'Install the signed npm package globally')) {
   & npm install --global '@heelee912/omnicodex' --ignore-scripts
   if ($LASTEXITCODE -ne 0) { throw 'npm installation failed.' }

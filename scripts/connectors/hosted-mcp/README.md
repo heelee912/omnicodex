@@ -9,7 +9,7 @@ does not provision provider resources, log in, start a tunnel or restart anythin
 
 ## Guided first install
 
-Requirements: Node >=22.12, a private OS user profile, and Windows CurrentUser
+Requirements: Node >=24.14.0, a private OS user profile, and Windows CurrentUser
 DPAPI / Windows PowerShell for credential use. Non-Windows login/stdio fail
 closed; setup never substitutes plaintext credentials or another login.
 

@@ -46,7 +46,7 @@ installed skill does not become a Chrome or Codex in-app browser surface.
 
 ## First install: end-to-end
 
-Requirements: Windows, Node.js 22.12 or newer, an installed and signed-in Codex
+Requirements: Windows, Node.js 24.14.0 or newer, an installed and signed-in Codex
 Desktop runtime, and Rust (`rustc.exe` in the current user's `.cargo/bin`) when
 the Desktop bridge must be installed or rebuilt. The npm package contains the
 launcher source, not a prebuilt `.exe`.
