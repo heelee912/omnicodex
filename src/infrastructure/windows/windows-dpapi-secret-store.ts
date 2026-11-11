@@ -38,7 +38,9 @@ export class WindowsDpapiSecretStore implements ReadableSecretReferenceStore {
     this.#directory = resolve(options.directory);
     const childProcesses = options.childProcesses ?? new HiddenChildProcessBoundary();
     const executable = windowsPowerShellPath(options.systemRoot ?? process.env.SystemRoot);
-    const timeoutMs = options.timeoutMs;
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)
+      throw new Error("DPAPI bridge timeout must be a positive safe integer");
     this.#protect =
       options.protect ??
       ((secret) => runDpapiBridge(childProcesses, executable, protectScript, secret, timeoutMs));
@@ -123,7 +125,7 @@ async function runDpapiBridge(
   executable: string,
   script: string,
   input: string,
-  timeoutMs: number | undefined,
+  timeoutMs: number,
 ): Promise<string> {
   const encodedScript = Buffer.from(script, "utf16le").toString("base64");
   const child = childProcesses.spawnHidden(
@@ -146,7 +148,7 @@ function collectBridgeResult(
   childProcesses: HiddenChildProcessBoundary,
   child: OwnedHiddenChildProcess,
   input: string,
-  timeoutMs: number | undefined,
+  timeoutMs: number,
 ): Promise<string> {
   return new Promise((resolveResult, rejectResult) => {
     let settled = false;
@@ -160,7 +162,11 @@ function collectBridgeResult(
       else resolveResult(stdout.toString("utf8"));
     };
     const cancelTimeout = scheduleOptionalTimeout(timeoutMs, () => {
-      childProcesses.terminateOwnedHiddenChild(child);
+      try {
+        childProcesses.terminateOwnedHiddenChild(child);
+      } catch {
+        // The deadline still settles this call if termination itself failed.
+      }
       finish(new Error("DPAPI bridge timed out"));
     });
     child.stdout?.on("data", (chunk: Buffer | string) => {
@@ -172,6 +178,8 @@ function collectBridgeResult(
       }
       stdout = Buffer.concat([stdout, next]);
     });
+    child.stderr?.resume();
+    child.stdout?.on("error", () => finish(new Error("DPAPI bridge stdout failed")));
     child.once("error", () => finish(new Error("DPAPI bridge failed to start")));
     child.once("close", (code) => {
       if (outputTooLarge) finish(new Error("DPAPI bridge output exceeded its limit"));
@@ -182,15 +190,20 @@ function collectBridgeResult(
       finish(new Error("DPAPI bridge stdin is unavailable"));
       return;
     }
-    child.stdin.end(input, "utf8");
+    child.stdin.on("error", () => {
+      childProcesses.terminateOwnedHiddenChild(child);
+      finish(new Error("DPAPI bridge stdin failed"));
+    });
+    try {
+      child.stdin.end(input, "utf8");
+    } catch {
+      childProcesses.terminateOwnedHiddenChild(child);
+      finish(new Error("DPAPI bridge stdin failed"));
+    }
   });
 }
 
-function scheduleOptionalTimeout(timeoutMs: number | undefined, expire: () => void): () => void {
-  if (timeoutMs === undefined) return () => undefined;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
-    throw new Error("DPAPI bridge timeout must be a positive safe integer");
-  }
+function scheduleOptionalTimeout(timeoutMs: number, expire: () => void): () => void {
   const maximumTimerDelayMs = 2_147_483_647n;
   const deadline = BigInt(Date.now()) + BigInt(timeoutMs);
   let timer: NodeJS.Timeout | undefined;
@@ -199,7 +212,7 @@ function scheduleOptionalTimeout(timeoutMs: number | undefined, expire: () => vo
     if (cancelled) return;
     const remainingMs = deadline - BigInt(Date.now());
     if (remainingMs <= 0n) {
-      expire();
+      timer = setTimeout(expire, 0);
       return;
     }
     timer = setTimeout(

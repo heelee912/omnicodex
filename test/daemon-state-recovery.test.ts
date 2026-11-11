@@ -1,5 +1,5 @@
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, uptime } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -253,18 +253,21 @@ describe("daemon state recovery", () => {
   });
 
   it.each(["alive", "unknown"] as const)(
-    "does not steal an expired lifecycle lock from an %s owner",
+    "does not steal a current-boot lifecycle lock from an %s owner",
     async (ownerProcessStatus) => {
       const directory = await makeTemporaryDirectory();
       const statePath = join(directory, "state.json");
       const lockPath = `${statePath}.lifecycle.lock`;
+      // A fresh CI VM can be younger than six minutes; keep this synthetic
+      // owner inside the current boot instead of accidentally testing reboot recovery.
+      const lockAgeMs = Math.min(6 * 60 * 1_000, Math.floor((uptime() * 1_000) / 2));
       await writeFile(
         lockPath,
         `${JSON.stringify({
           schemaVersion: 1,
           pid: 4242,
           nonce: "reused-pid",
-          createdAtUnixMs: Date.now() - 6 * 60 * 1_000,
+          createdAtUnixMs: Date.now() - lockAgeMs,
         })}\n`,
         "utf8",
       );

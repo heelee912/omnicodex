@@ -1,7 +1,9 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { HiddenChildProcessBoundary } from "../src/infrastructure/windows/hidden-child-process.js";
 import { WindowsDpapiSecretStore } from "../src/infrastructure/windows/windows-dpapi-secret-store.js";
 
 const temporaryDirectories: string[] = [];
@@ -45,6 +47,55 @@ describe("WindowsDpapiSecretStore", () => {
     });
     await expect(store.put("weak", "short")).rejects.toThrow("bounded");
     await expect(store.get("dpapi:v1:../escape")).rejects.toThrow("Invalid");
+  });
+  it("drains a large native stderr stream without exposing its contents", async () => {
+    const directory = await temporaryDirectory();
+    const code = [
+      "process.stdin.resume();",
+      "process.stdin.on('end', () => {",
+      "  process.stderr.write('private-marker'.repeat(20_000));",
+      "  process.stdout.end('cHJvdGVjdGVk');",
+      "});",
+    ].join("\n");
+    const childProcesses = new HiddenChildProcessBoundary((_executable, _args, options) =>
+      spawn(process.execPath, ["-e", code], options),
+    );
+    const store = new WindowsDpapiSecretStore({
+      directory,
+      systemRoot: "C:\\Windows",
+      childProcesses,
+      timeoutMs: 5_000,
+    });
+    await expect(store.put("synthetic", "synthetic-secret-long-enough")).resolves.toMatch(
+      /^dpapi:v1:[A-Za-z0-9_-]{43}$/u,
+    );
+  });
+
+  it("bounds a stalled owned bridge instead of waiting forever", async () => {
+    const directory = await temporaryDirectory();
+    const childProcesses = new HiddenChildProcessBoundary((_executable, _args, options) =>
+      spawn(
+        process.execPath,
+        ["-e", "process.stdin.resume(); setInterval(() => {}, 1000);"],
+        options,
+      ),
+    );
+    const store = new WindowsDpapiSecretStore({
+      directory,
+      systemRoot: "C:\\Windows",
+      childProcesses,
+      timeoutMs: 100,
+    });
+    await expect(store.put("synthetic", "synthetic-secret-long-enough")).rejects.toThrow(
+      "DPAPI bridge timed out",
+    );
+  });
+
+  it("rejects an invalid bridge deadline before launching a child", async () => {
+    const directory = await temporaryDirectory();
+    expect(
+      () => new WindowsDpapiSecretStore({ directory, systemRoot: "C:\\Windows", timeoutMs: 0 }),
+    ).toThrow("DPAPI bridge timeout must be a positive safe integer");
   });
 });
 
