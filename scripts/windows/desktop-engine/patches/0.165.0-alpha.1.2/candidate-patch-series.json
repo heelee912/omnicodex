@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "upstreamCommit": "720fec862a608ae1e5878d1eecb04fb93192e93c",
+  "upstreamTag": "rust-v0.165.0-alpha.1.2",
+  "codexCliVersion": "0.165.0-alpha.1.2",
+  "excludedGeneratedFiles": ["codex-rs/Cargo.lock"],
+  "patches": [
+    {
+      "file": "01-protected-documentation.patch",
+      "sha256": "cee3cf2af43f6961fdba284a021f21ae58fd2854998cf7a1452477097c07bdc1",
+      "files": 7,
+      "purpose": "Serve protected Korean policy Markdown directly from the original Codex engine"
+    },
+    {
+      "file": "02-shared-desktop-server.patch",
+      "sha256": "304fa0a079605a6bd5e378a60e11a48ee2add0bb8061b5e9364b09cd6a2e61a1",
+      "files": 16,
+      "purpose": "Attach OmniCodex to the Desktop app-server pipe and preserve request ownership"
+    },
+    {
+      "file": "03-turn-recovery.patch",
+      "sha256": "cb221b663fb0d2c06be1ae69e1b8cd19e86263e9ceda3cf50ce7f47c7d4c264f",
+      "files": 13,
+      "purpose": "End interrupted or failed turns and bound stalled requests"
+    },
+    {
+      "file": "04-lazy-mcp-startup.patch",
+      "sha256": "a182a3358d171e0d598ba525e76d4528bccb0bed6389032bf30a6b2982d4b6ea",
+      "files": 1,
+      "purpose": "Start cached optional MCP servers only when their tools are called"
+    },
+    {
+      "file": "05-retained-mcp-status.patch",
+      "sha256": "b4af055d0f59087d457bba7a8a2901ddd208836b3a6a59d93352a431d94ce2ae",
+      "files": 12,
+      "purpose": "Reuse live thread MCP connections and retain status-only connections for remaining servers"
+    },
+    {
+      "file": "06-local-mcp-protected-documentation.patch",
+      "sha256": "feb64154e01257848056f6085cc54198ee4ef72477ba128c26b4f6bf12c78756",
+      "files": 3,
+      "purpose": "Return protected Korean Markdown from the original engine for MCP documentation calls"
+    }
+  ],
+  "validation": [
+    "Candidate only; do not install before Rust compile and runtime verification",
+    "Check all six patches together against the target tag"
+  ]
+}

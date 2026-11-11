@@ -1,0 +1,577 @@
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+index 11f05553259f3fdfbff6a2ec5d2760a053465dbc..34168b1cbddcf67af9d706d15f4ab7cf4a40f231 100644
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -1097,14 +1097,22 @@ pub(crate) async fn apply_bespoke_event_handling(
+                 _ => true,
+             };
+             let dynamic_tool_call_params = match &event.item {
+-                CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
+-                    thread_id: conversation_id.to_string(),
+-                    turn_id: event.turn_id.clone(),
+-                    call_id: item.id.clone(),
+-                    namespace: item.namespace.clone(),
+-                    tool: item.tool.clone(),
+-                    arguments: item.arguments.clone(),
+-                }),
++                CoreTurnItem::DynamicToolCall(item)
++                    if !codex_core::is_protected_dynamic_documentation_call(
++                        item.namespace.as_deref(),
++                        &item.tool,
++                        &item.arguments,
++                    ) =>
++                {
++                    Some(DynamicToolCallParams {
++                        thread_id: conversation_id.to_string(),
++                        turn_id: event.turn_id.clone(),
++                        call_id: item.id.clone(),
++                        namespace: item.namespace.clone(),
++                        tool: item.tool.clone(),
++                        arguments: item.arguments.clone(),
++                    })
++                }
+                 _ => None,
+             };
+             if should_emit {
+@@ -3421,6 +3429,80 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn protected_documentation_start_does_not_request_host() -> Result<()> {
++        let codex_home = TempDir::new()?;
++        let config = load_default_config_for_test(&codex_home).await;
++        let thread_manager = Arc::new(
++            codex_core::test_support::thread_manager_with_models_provider_and_home(
++                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
++                config.model_provider.clone(),
++                config.codex_home.to_path_buf(),
++                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++            ),
++        );
++        let codex_core::NewThread {
++            thread_id: conversation_id,
++            thread: conversation,
++            ..
++        } = thread_manager
++            .start_thread(codex_core::StartThreadOptions::new(config))
++            .await?;
++        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
++        let outgoing = Arc::new(OutgoingMessageSender::new(
++            tx,
++            codex_analytics::AnalyticsEventsClient::disabled(),
++        ));
++        let outgoing = ThreadScopedOutgoingMessageSender::new(
++            outgoing,
++            vec![ConnectionId(1)],
++            conversation_id,
++        );
++
++        apply_bespoke_event_handling(
++            Event {
++                id: "turn-policy".to_string(),
++                msg: EventMsg::ItemStarted(ItemStartedEvent {
++                    thread_id: conversation_id,
++                    turn_id: "turn-policy".to_string(),
++                    item: CoreTurnItem::DynamicToolCall(DynamicToolCallItem {
++                        id: "policy-documentation".to_string(),
++                        namespace: None,
++                        tool: "chrome__control_chrome".to_string(),
++                        arguments: json!({
++                            "operation": "documentation",
++                            "documentation_name": "confirmations",
++                        }),
++                        status: CoreDynamicToolCallStatus::InProgress,
++                        content_items: None,
++                        success: None,
++                        error: None,
++                        duration: None,
++                    }),
++                    started_at_ms: 42,
++                }),
++            },
++            conversation_id,
++            conversation,
++            thread_manager,
++            outgoing,
++            new_thread_state(),
++            ThreadWatchManager::new(),
++        )
++        .await;
++
++        let notification = recv_broadcast_notification(&mut rx).await?;
++        let ServerNotification::ItemStarted(payload) = notification else {
++            bail!("unexpected message: {notification:?}");
++        };
++        assert_eq!(payload.item.id(), "policy-documentation");
++        assert!(
++            rx.try_recv().is_err(),
++            "host must not receive a tool request"
++        );
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn test_handle_turn_complete_emits_completed_without_error() -> Result<()> {
+         let conversation_id = ThreadId::new();
+diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
+index 245f417b18f8afa80e8e8bbdf3ab525f86bf5c8e..061f6844e1f2c4c23dbab28a5c317980f7ab4436 100644
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -110,6 +110,7 @@ rmcp = { workspace = true, default-features = false, features = [
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ sha1 = { workspace = true }
++sha2 = { workspace = true }
+ shlex = { workspace = true }
+ similar = { workspace = true }
+ tempfile = { workspace = true }
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 390b658b60cee1f3823f37d2d096949a09235965..77588d92c67e83b945507be889e713d4961beac9 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -183,6 +183,8 @@ mod agents_md_manager;
+ pub use agents_md::DEFAULT_AGENTS_MD_FILENAME;
+ pub use agents_md::LOCAL_AGENTS_MD_FILENAME;
+ pub use agents_md::LoadedAgentsMd;
++mod protected_documentation;
++pub use protected_documentation::is_protected_dynamic_documentation_call;
+ mod rollout;
+ mod rollout_budget;
+ pub(crate) mod safety;
+diff --git a/codex-rs/core/src/protected_documentation.rs b/codex-rs/core/src/protected_documentation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..19f5879ffc0c0cced34ae0412533a711bab93c2e
+--- /dev/null
++++ b/codex-rs/core/src/protected_documentation.rs
+@@ -0,0 +1,137 @@
++use std::path::Path;
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::bail;
++use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
++use codex_protocol::dynamic_tools::DynamicToolResponse;
++use serde_json::Value;
++use sha2::Digest;
++use sha2::Sha256;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum ProtectedDocument {
++    ChromeConfirmations,
++    ChromeBrowserSafety,
++    AppBrowserSafety,
++}
++
++impl ProtectedDocument {
++    pub(crate) fn for_call(
++        namespace: Option<&str>,
++        tool_name: &str,
++        arguments: &Value,
++    ) -> Option<Self> {
++        if arguments.get("operation")?.as_str()? != "documentation" {
++            return None;
++        }
++        let document_name = arguments.get("documentation_name")?.as_str()?.trim();
++        let tool_name = match (namespace, tool_name) {
++            (None, name) => name,
++            (Some("chrome"), "control_chrome" | "chrome__control_chrome") => {
++                "chrome__control_chrome"
++            }
++            (Some("browser"), "control_in_app_browser" | "browser__control_in_app_browser") => {
++                "browser__control_in_app_browser"
++            }
++            _ => return None,
++        };
++        match (tool_name, document_name) {
++            ("chrome__control_chrome" | "browser__control_in_app_browser", "confirmations") => {
++                Some(Self::ChromeConfirmations)
++            }
++            ("chrome__control_chrome", "browser-safety") => Some(Self::ChromeBrowserSafety),
++            ("browser__control_in_app_browser", "browser-safety") => Some(Self::AppBrowserSafety),
++            _ => None,
++        }
++    }
++
++    fn file_name(self) -> &'static str {
++        match self {
++            Self::ChromeConfirmations => "chrome-confirmations.md",
++            Self::ChromeBrowserSafety => "chrome-browser-safety.md",
++            Self::AppBrowserSafety => "codex-app-browser-safety.md",
++        }
++    }
++}
++
++/// The app server uses this check to avoid requesting a document from the host.
++pub fn is_protected_dynamic_documentation_call(
++    namespace: Option<&str>,
++    tool_name: &str,
++    arguments: &Value,
++) -> bool {
++    ProtectedDocument::for_call(namespace, tool_name, arguments).is_some()
++}
++
++/// Write the verified document into the response shared by the user event and model.
++pub(crate) async fn set_protected_document_response(
++    codex_home: &Path,
++    document: ProtectedDocument,
++    response: &mut DynamicToolResponse,
++) {
++    let (markdown, success) = match read_verified_markdown(codex_home, document).await {
++        Ok(markdown) => (markdown, true),
++        Err(error) => {
++            tracing::warn!(file = document.file_name(), %error, "protected documentation unavailable");
++            (
++                "# 보호 문서 오류\n\n보호된 한글 Markdown을 확인할 수 없습니다.".to_string(),
++                false,
++            )
++        }
++    };
++    response.content_items = vec![DynamicToolCallOutputContentItem::InputText { text: markdown }];
++    response.success = success;
++}
++
++async fn read_verified_markdown(codex_home: &Path, document: ProtectedDocument) -> Result<String> {
++    let root = codex_home.join("protected-confirmation-docs");
++    let manifest_bytes = tokio::fs::read(root.join("manifest.json"))
++        .await
++        .context("protected document manifest read failed")?;
++    let manifest: Vec<Value> = serde_json::from_slice(&manifest_bytes)
++        .context("protected document manifest is not an array")?;
++    let file_name = document.file_name();
++    let entries = manifest
++        .iter()
++        .filter(|entry| {
++            entry
++                .get("Source")
++                .and_then(Value::as_str)
++                .and_then(|source| source.rsplit(|ch| ch == '/' || ch == '\\').next())
++                .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
++        })
++        .collect::<Vec<_>>();
++    if entries.len() != 1 {
++        bail!("protected document manifest has no unique entry for {file_name}");
++    }
++    let expected_hash = entries[0]
++        .get("SHA256")
++        .and_then(Value::as_str)
++        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
++        .context("protected document manifest hash is invalid")?;
++    let markdown_bytes = tokio::fs::read(root.join(file_name))
++        .await
++        .context("protected document read failed")?;
++    let actual_hash = format!("{:x}", Sha256::digest(&markdown_bytes));
++    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
++        bail!("protected document hash mismatch for {file_name}");
++    }
++    let markdown = String::from_utf8(markdown_bytes).context("protected document is not UTF-8")?;
++    let has_heading = markdown.lines().any(|line| {
++        line.strip_prefix('#').is_some_and(|rest| {
++            rest.chars().next().is_some_and(char::is_whitespace) && !rest.trim().is_empty()
++        })
++    });
++    let has_hangul = markdown
++        .chars()
++        .any(|ch| ('\u{AC00}'..='\u{D7A3}').contains(&ch));
++    if !has_heading || !has_hangul {
++        bail!("protected document is not Korean Markdown: {file_name}");
++    }
++    Ok(markdown)
++}
++
++#[cfg(test)]
++#[path = "protected_documentation_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/protected_documentation_tests.rs b/codex-rs/core/src/protected_documentation_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..adf025ca3dafe6604a4b384ffa9aef1ab763d0bb
+--- /dev/null
++++ b/codex-rs/core/src/protected_documentation_tests.rs
+@@ -0,0 +1,139 @@
++use super::*;
++use serde_json::json;
++
++#[test]
++fn selects_only_named_browser_policy_documents() {
++    let cases = [
++        (
++            "chrome__control_chrome",
++            "confirmations",
++            Some(ProtectedDocument::ChromeConfirmations),
++        ),
++        (
++            "chrome__control_chrome",
++            " confirmations ",
++            Some(ProtectedDocument::ChromeConfirmations),
++        ),
++        (
++            "chrome__control_chrome",
++            "browser-safety",
++            Some(ProtectedDocument::ChromeBrowserSafety),
++        ),
++        (
++            "browser__control_in_app_browser",
++            "browser-safety",
++            Some(ProtectedDocument::AppBrowserSafety),
++        ),
++        ("other_tool", "confirmations", None),
++        ("chrome__control_chrome", "api", None),
++    ];
++    for (tool_name, document_name, expected) in cases {
++        let arguments = json!({
++            "operation": "documentation",
++            "documentation_name": document_name,
++        });
++        assert_eq!(
++            ProtectedDocument::for_call(None, tool_name, &arguments),
++            expected,
++        );
++    }
++    let arguments = json!({"operation": "documentation", "documentation_name": "confirmations"});
++    assert_eq!(
++        ProtectedDocument::for_call(Some("chrome"), "control_chrome", &arguments),
++        Some(ProtectedDocument::ChromeConfirmations),
++    );
++    assert_eq!(
++        ProtectedDocument::for_call(Some("unrelated"), "chrome__control_chrome", &arguments),
++        None,
++    );
++    assert_eq!(
++        ProtectedDocument::for_call(
++            None,
++            "chrome__control_chrome",
++            &json!({"operation": "exec", "documentation_name": "confirmations"}),
++        ),
++        None,
++    );
++}
++
++#[tokio::test]
++async fn replaces_all_host_content_with_verified_korean_markdown() -> Result<()> {
++    let home = tempfile::tempdir()?;
++    let root = home.path().join("protected-confirmation-docs");
++    tokio::fs::create_dir(&root).await?;
++    let markdown = "# 확인 정책\n\n승인 절차입니다.\n";
++    let hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
++    tokio::fs::write(root.join("chrome-confirmations.md"), markdown).await?;
++    tokio::fs::write(
++        root.join("manifest.json"),
++        serde_json::to_vec(&json!([{
++            "Source": "C:\\protected\\chrome-confirmations.md",
++            "SHA256": hash,
++        }]))?,
++    )
++    .await?;
++    let mut response = host_response();
++
++    set_protected_document_response(
++        home.path(),
++        ProtectedDocument::ChromeConfirmations,
++        &mut response,
++    )
++    .await;
++
++    assert_eq!(
++        response.content_items,
++        vec![DynamicToolCallOutputContentItem::InputText {
++            text: markdown.to_string(),
++        }]
++    );
++    assert!(response.success);
++    Ok(())
++}
++
++#[tokio::test]
++async fn verification_failure_never_returns_host_content() -> Result<()> {
++    for manifest in [
++        None,
++        Some(json!([{
++            "Source": "chrome-confirmations.md",
++            "SHA256": "0".repeat(64),
++        }])),
++        Some(json!([
++            {"Source": "chrome-confirmations.md", "SHA256": "0".repeat(64)},
++            {"Source": "C:\\other\\chrome-confirmations.md", "SHA256": "0".repeat(64)},
++        ])),
++    ] {
++        let home = tempfile::tempdir()?;
++        let root = home.path().join("protected-confirmation-docs");
++        tokio::fs::create_dir(&root).await?;
++        tokio::fs::write(root.join("chrome-confirmations.md"), "# 확인\n\n한글\n").await?;
++        if let Some(manifest) = manifest {
++            tokio::fs::write(root.join("manifest.json"), serde_json::to_vec(&manifest)?).await?;
++        }
++        let mut response = host_response();
++
++        set_protected_document_response(
++            home.path(),
++            ProtectedDocument::ChromeConfirmations,
++            &mut response,
++        )
++        .await;
++
++        assert!(!response.success);
++        let serialized = serde_json::to_string(&response)?;
++        assert!(!serialized.contains("UNTRUSTED_HOST_CONTENT"));
++        assert!(serialized.contains("보호 문서 오류"));
++        assert_eq!(response.content_items.len(), 1);
++    }
++    Ok(())
++}
++
++fn host_response() -> DynamicToolResponse {
++    DynamicToolResponse {
++        content_items: vec![DynamicToolCallOutputContentItem::InputText {
++            text: "UNTRUSTED_HOST_CONTENT".to_string(),
++        }],
++        success: false,
++    }
++}
+diff --git a/codex-rs/core/src/tools/handlers/dynamic.rs b/codex-rs/core/src/tools/handlers/dynamic.rs
+index 0eac846e05187ab469d9ecc33f295b75e06f7a48..b5272fe9db4d62601e079f1fbcdd59a06d397c11 100644
+--- a/codex-rs/core/src/tools/handlers/dynamic.rs
++++ b/codex-rs/core/src/tools/handlers/dynamic.rs
+@@ -1,4 +1,6 @@
+ use crate::function_tool::FunctionCallError;
++use crate::protected_documentation::ProtectedDocument;
++use crate::protected_documentation::set_protected_document_response;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+ use crate::tools::context::FunctionToolOutput;
+@@ -200,6 +202,7 @@ async fn request_dynamic_tool(
+     }
+     let namespace = tool_name.namespace;
+     let tool = tool_name.name;
++    let protected_document = ProtectedDocument::for_call(namespace.as_deref(), &tool, &arguments);
+     let (tx_response, rx_response) = oneshot::channel();
+     let event_id = call_id.clone();
+     let prev_entry = {
+@@ -208,6 +211,7 @@ async fn request_dynamic_tool(
+             return None;
+         }
+         match active.as_mut() {
++            Some(_) if protected_document.is_some() => None,
+             Some(at) => {
+                 let mut ts = at.turn_state.lock().await;
+                 ts.insert_pending_dynamic_tool(call_id.clone(), tx_response)
+@@ -236,11 +240,24 @@ async fn request_dynamic_tool(
+             }),
+         )
+         .await;
+-    let response = rx_response
+-        .or_cancel(&cancellation_token)
+-        .await
+-        .ok()
+-        .and_then(Result::ok);
++    let response = if let Some(document) = protected_document {
++        let codex_home = turn_context.config.codex_home.to_path_buf();
++        let mut response = DynamicToolResponse {
++            content_items: Vec::new(),
++            success: false,
++        };
++        set_protected_document_response(&codex_home, document, &mut response)
++            .or_cancel(&cancellation_token)
++            .await
++            .ok()
++            .map(|()| response)
++    } else {
++        rx_response
++            .or_cancel(&cancellation_token)
++            .await
++            .ok()
++            .and_then(Result::ok)
++    };
+ 
+     let item = match &response {
+         Some(response) => DynamicToolCallItem {
+diff --git a/codex-rs/core/src/tools/handlers/dynamic_tests.rs b/codex-rs/core/src/tools/handlers/dynamic_tests.rs
+index 2d926b321d0347ebc051c5604244e21dee390cb3..58c7b7d73bc978fa8e90e1a37a10abd1f88aad76 100644
+--- a/codex-rs/core/src/tools/handlers/dynamic_tests.rs
++++ b/codex-rs/core/src/tools/handlers/dynamic_tests.rs
+@@ -2,10 +2,13 @@
+ 
+ use super::*;
+ use crate::state::ActiveTurn;
++use codex_login::CodexAuth;
+ use codex_protocol::protocol::Event;
+ use codex_protocol::protocol::EventMsg;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
++use sha2::Digest;
++use sha2::Sha256;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+@@ -74,3 +77,72 @@ async fn response_cancel_race_completes_once() {
+         assert!(!matches!(event.msg, EventMsg::ItemCompleted(_)));
+     }
+ }
++
++#[tokio::test]
++async fn protected_documentation_completes_without_host_response() {
++    let home = tempfile::tempdir().expect("temporary Codex home");
++    let root = home.path().join("protected-confirmation-docs");
++    tokio::fs::create_dir(&root)
++        .await
++        .expect("protected directory");
++    let markdown = "# 확인 정책\n\n한글 문서입니다.\n";
++    tokio::fs::write(root.join("chrome-confirmations.md"), markdown)
++        .await
++        .expect("protected Markdown");
++    let hash = format!("{:x}", Sha256::digest(markdown.as_bytes()));
++    tokio::fs::write(
++        root.join("manifest.json"),
++        serde_json::to_vec(&json!([{
++            "Source": "C:\\protected\\chrome-confirmations.md",
++            "SHA256": hash,
++        }]))
++        .expect("manifest JSON"),
++    )
++    .await
++    .expect("protected manifest");
++    let (session, turn, receiver) =
++        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
++            CodexAuth::from_api_key("Test API Key"),
++            Vec::new(),
++            home.path(),
++            |_| {},
++        )
++        .await;
++    *session.active_turn.lock().await = Some(ActiveTurn::default());
++    let lifecycle = tokio::spawn({
++        let session = Arc::clone(&session);
++        async move {
++            request_dynamic_tool(
++                &session,
++                &turn,
++                "policy-call".to_string(),
++                ToolName::plain("chrome__control_chrome"),
++                json!({
++                    "operation": "documentation",
++                    "documentation_name": "confirmations",
++                }),
++                CancellationToken::new(),
++            )
++            .await
++        }
++    });
++
++    let started = next_item(&receiver).await;
++    assert_eq!(started.status, DynamicToolCallStatus::InProgress);
++    let response = tokio::time::timeout(Duration::from_secs(5), lifecycle)
++        .await
++        .expect("protected document should not await host")
++        .expect("dynamic tool task")
++        .expect("protected document response");
++    assert_eq!(
++        response.content_items,
++        vec![
++            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText {
++                text: markdown.to_string(),
++            }
++        ]
++    );
++    let completed = next_item(&receiver).await;
++    assert_eq!(completed.status, DynamicToolCallStatus::Completed);
++    assert_eq!(completed.content_items, Some(response.content_items));
++}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Safely attempt one Always Free OCI Ampere A1 instance
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/omnicodex-a1-capacity.env
+ExecStart=/opt/omnicodex-a1-capacity/a1-capacity-run.sh
+NoNewPrivileges=true
+PrivateTmp=true

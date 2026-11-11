@@ -1,0 +1,33 @@
+[Unit]
+Description=OmniCodex Oracle isolated ChatGPT browser
+Requires=omnicodex-oracle-xvfb.service
+After=omnicodex-oracle-xvfb.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=DISPLAY=:177
+EnvironmentFile=/etc/omnicodex-oracle-browser.env
+ExecStartPre=/usr/bin/test -x /opt/omnicodex-oracle-browser/oracle-browser-profile.py
+ExecStartPre=/usr/bin/python3 /opt/omnicodex-oracle-browser/oracle-browser-profile.py --prepare-start ${ORACLE_BROWSER_PROFILE}
+ExecStart=/opt/omnicodex-oracle-browser/oracle-browser-run.sh
+ExecStop=-/usr/bin/python3 /opt/omnicodex-oracle-browser/oracle-browser-profile.py --close-targets http://127.0.0.1:19222
+Restart=always
+RestartSec=3s
+TimeoutStopSec=20s
+KillMode=control-group
+MemoryHigh=70%
+MemoryMax=85%
+MemorySwapMax=2G
+MemoryLow=512M
+OOMPolicy=continue
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-/home/ubuntu/omnicodex-lab -/home/ubuntu/snap/chromium
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

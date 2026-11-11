@@ -1,0 +1,19 @@
+[Unit]
+Description=OmniCodex Oracle isolated virtual display
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu/omnicodex-lab/home
+ExecStart=/usr/bin/Xvfb :177 -screen 0 1920x1080x24 -nolisten tcp -ac
+Restart=on-failure
+RestartSec=2s
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/omnicodex-lab
+
+[Install]
+WantedBy=multi-user.target

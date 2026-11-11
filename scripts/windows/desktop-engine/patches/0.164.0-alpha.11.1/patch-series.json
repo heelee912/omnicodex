@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "upstreamCommit": "6905ecede7816e91373e9eabda3f6b0368fc747b",
+  "upstreamTag": "rust-v0.164.0-alpha.11.1",
+  "codexCliVersion": "0.164.0-alpha.11.1",
+  "excludedGeneratedFiles": ["codex-rs/Cargo.lock"],
+  "patches": [
+    {
+      "file": "01-protected-documentation.patch",
+      "sha256": "a43d78a1b4d2bca1090367441318d38a3a24475ce2ea9b87763f235265e7ccd7",
+      "files": 7,
+      "purpose": "Read protected Korean Markdown in core and avoid a host tool request"
+    },
+    {
+      "file": "02-shared-desktop-server.patch",
+      "sha256": "304fa0a079605a6bd5e378a60e11a48ee2add0bb8061b5e9364b09cd6a2e61a1",
+      "files": 16,
+      "purpose": "Attach OmniCodex to the Desktop app-server pipe and preserve request ownership"
+    },
+    {
+      "file": "03-turn-recovery.patch",
+      "sha256": "cb221b663fb0d2c06be1ae69e1b8cd19e86263e9ceda3cf50ce7f47c7d4c264f",
+      "files": 13,
+      "purpose": "End interrupted or failed turns and bound stalled requests"
+    }
+  ],
+  "validation": [
+    "All three patches applied in order to an isolated index at upstreamCommit",
+    "The replayed index had the same 36 changed source file paths as the working tree",
+    "All three reverse checks passed against the current patched source"
+  ]
+}

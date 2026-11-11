@@ -1,0 +1,17 @@
+diff --git a/codex-rs/core/src/session/mcp_runtime.rs b/codex-rs/core/src/session/mcp_runtime.rs
+index d00bb6af4135ff622e211366f2f6c226fbcc324b..48c57b204fe92cd11acb1db8537c7853857074d7 100644
+--- a/codex-rs/core/src/session/mcp_runtime.rs
++++ b/codex-rs/core/src/session/mcp_runtime.rs
+@@ -368,11 +368,7 @@ impl Session {
+         );
+         McpRuntimeInput {
+             network_policy_metadata: None,
+-            startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
+-                McpStartupPolicy::LazyWhenCached
+-            } else {
+-                McpStartupPolicy::Eager
+-            },
++            startup_policy: McpStartupPolicy::LazyWhenCached,
+             config: mcp_config,
+             plugins_available,
+             ready_selected_capability_roots: ready_selected_capability_roots.to_vec(),

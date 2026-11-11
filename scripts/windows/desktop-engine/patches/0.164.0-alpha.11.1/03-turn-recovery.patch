@@ -1,0 +1,1927 @@
+diff --git a/codex-rs/codex-api/src/endpoint/session.rs b/codex-rs/codex-api/src/endpoint/session.rs
+index 7849225b5cbb6c37456d14e85b3fe069d878ada3..13387ca7f70115dfefb7803ca5f9a71b7298e617 100644
+--- a/codex-rs/codex-api/src/endpoint/session.rs
++++ b/codex-rs/codex-api/src/endpoint/session.rs
+@@ -136,20 +136,31 @@ impl<T: HttpTransport> EndpointSession<T> {
+         let request = request.into_prepared().map_err(TransportError::Build)?;
+         let make_request = || request.clone();
+ 
+-        let stream = run_with_request_telemetry(
+-            self.provider.retry.to_policy(),
+-            self.request_telemetry.clone(),
+-            make_request,
+-            |req| {
+-                let auth = self.auth.clone();
+-                let transport = &self.transport;
+-                async move {
+-                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
+-                    transport.stream(req).await
+-                }
+-            },
++        // The SSE idle deadline begins only after response headers arrive. Bound
++        // authentication, retry, and header wait by the same provider deadline.
++        let stream = tokio::time::timeout(
++            self.provider.stream_idle_timeout,
++            run_with_request_telemetry(
++                self.provider.retry.to_policy(),
++                self.request_telemetry.clone(),
++                make_request,
++                |req| {
++                    let auth = self.auth.clone();
++                    let transport = &self.transport;
++                    async move {
++                        let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                        transport.stream(req).await
++                    }
++                },
++            ),
+         )
+-        .await?;
++        .await
++        .map_err(|_| {
++            ApiError::Stream(format!(
++                "stream response headers timed out after {:?}",
++                self.provider.stream_idle_timeout
++            ))
++        })??;
+ 
+         Ok(stream)
+     }
+diff --git a/codex-rs/codex-api/tests/sse_end_to_end.rs b/codex-rs/codex-api/tests/sse_end_to_end.rs
+index bf72eda9c01d505a5748b900f27ca3ed3f11fcf6..cd27a275235e51b55d566934ef44d1d53098e91f 100644
+--- a/codex-rs/codex-api/tests/sse_end_to_end.rs
++++ b/codex-rs/codex-api/tests/sse_end_to_end.rs
+@@ -49,6 +49,19 @@ impl HttpTransport for FixtureSseTransport {
+     }
+ }
+ 
++#[derive(Clone)]
++struct HangingHeadersTransport;
++
++impl HttpTransport for HangingHeadersTransport {
++    async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
++        Err(TransportError::Build("execute should not run".to_string()))
++    }
++
++    async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
++        std::future::pending().await
++    }
++}
++
+ #[derive(Clone, Default)]
+ struct NoAuth;
+ 
+@@ -75,6 +88,34 @@ fn provider(name: &str) -> Provider {
+     }
+ }
+ 
++#[tokio::test]
++async fn responses_stream_bounds_wait_for_headers() -> Result<()> {
++    let client = ResponsesClient::new(
++        HangingHeadersTransport,
++        provider("openai"),
++        Arc::new(NoAuth),
++    );
++    let result = tokio::time::timeout(
++        Duration::from_secs(1),
++        client.stream(
++            serde_json::json!({"echo": true}),
++            HeaderMap::new(),
++            Compression::None,
++            /*turn_state*/ None,
++        ),
++    )
++    .await?;
++    let Err(error) = result else {
++        panic!("stream unexpectedly received response headers");
++    };
++    assert!(
++        error
++            .to_string()
++            .contains("stream response headers timed out")
++    );
++    Ok(())
++}
++
+ fn build_responses_body(events: Vec<Value>) -> String {
+     let mut body = String::new();
+     for e in events {
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index bacf8c3a5c5453051a20c57df1c3275c57ac27c3..50563c98fb512d03de54d24d07fe468417a56c60 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -30,6 +30,8 @@ use crate::responses_retry::handle_response_stream_error;
+ use crate::session::RequestEffortUsage;
+ use crate::session::session::Session;
+ use crate::session::step_context::StepContext;
++use crate::session::turn::TurnPhase;
++use crate::session::turn::mark_turn_phase;
+ use crate::session::turn_context::TurnContext;
+ use codex_analytics::CompactionImplementation;
+ use codex_analytics::CompactionPhase;
+@@ -176,6 +178,7 @@ async fn run_remote_compact_task_inner(
+     fallback: CompactionFallback,
+ ) -> CodexResult<bool> {
+     let turn_context = &step_context.turn;
++    mark_turn_phase(turn_context, TurnPhase::preparation("compaction.prepare"));
+     let trigger = compaction_metadata.trigger();
+     let reason = compaction_metadata.reason();
+     let implementation = compaction_metadata.implementation();
+@@ -184,6 +187,10 @@ async fn run_remote_compact_task_inner(
+         active_context_tokens_before: Some(sess.get_total_token_usage().await),
+         ..Default::default()
+     };
++    mark_turn_phase(
++        turn_context,
++        TurnPhase::preparation("compaction.analytics_begin"),
++    );
+     let attempt = CompactionAnalyticsAttempt::begin(
+         sess.as_ref(),
+         turn_context.as_ref(),
+@@ -193,6 +200,7 @@ async fn run_remote_compact_task_inner(
+         phase,
+     )
+     .await;
++    mark_turn_phase(turn_context, TurnPhase::preparation("compaction.pre_hooks"));
+     let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
+     match pre_compact_outcome {
+         PreCompactHookOutcome::Continue => {}
+@@ -209,6 +217,10 @@ async fn run_remote_compact_task_inner(
+             return Err(error);
+         }
+     }
++    mark_turn_phase(
++        turn_context,
++        TurnPhase::preparation("compaction.item_started"),
++    );
+     let started_item = if candidate.is_none() {
+         let item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+         sess.emit_turn_item_started(turn_context, &item).await;
+@@ -216,11 +228,19 @@ async fn run_remote_compact_task_inner(
+     } else {
+         None
+     };
++    // Reported like preparation so a background request that never settles is named;
++    // the report is a log only and never ends the wait.
++    mark_turn_phase(
++        turn_context,
++        TurnPhase::preparation("compaction.wait_background_result"),
++    );
+     let candidate = if candidate.is_none() && fallback == CompactionFallback::Foreground {
+         crate::session::async_compaction::wait_for_pending(sess, step_context).await
+     } else {
+         candidate
+     };
++    // Request construction marks finer phases; model work starts only after sending.
++    mark_turn_phase(turn_context, TurnPhase::preparation("compaction.run"));
+     // Box the combined request/install future to keep it off the turn stack.
+     let result = Box::pin(run_compaction(
+         sess,
+@@ -329,6 +349,11 @@ async fn run_remote_compaction_request_v2(
+         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
+     let mut retry_state = ResponsesStreamRetryState::default();
+     loop {
++        // Effort lookup and sending are preparation; the compaction response is model work.
++        mark_turn_phase(
++            turn_context,
++            TurnPhase::preparation("compaction.request_send"),
++        );
+         let result = match client_session
+             .stream(
+                 prompt,
+@@ -344,6 +369,10 @@ async fn run_remote_compaction_request_v2(
+             .await
+         {
+             Ok(stream) => {
++                mark_turn_phase(
++                    turn_context,
++                    TurnPhase::model_work("compaction.model_stream"),
++                );
+                 collect_compaction_output(
+                     sess,
+                     turn_context,
+@@ -357,6 +386,10 @@ async fn run_remote_compaction_request_v2(
+         match result {
+             Ok(compaction_output) => return Ok(compaction_output),
+             Err(err) => {
++                mark_turn_phase(
++                    turn_context,
++                    TurnPhase::preparation("compaction.request_retry"),
++                );
+                 handle_response_stream_error(
+                     &mut retry_state,
+                     max_retries,
+diff --git a/codex-rs/core/src/compact_remote_v2_attempt.rs b/codex-rs/core/src/compact_remote_v2_attempt.rs
+index 3f14ac5be7da8ed6c72271e8ce287ff672feffc6..e73890fdbe844afb69f02b9a973d73004ffd39c5 100644
+--- a/codex-rs/core/src/compact_remote_v2_attempt.rs
++++ b/codex-rs/core/src/compact_remote_v2_attempt.rs
+@@ -18,6 +18,8 @@ use crate::responses_metadata::CompactionTurnMetadata;
+ use crate::session::CompactionPrefix;
+ use crate::session::session::Session;
+ use crate::session::step_context::StepContext;
++use crate::session::turn::TurnPhase;
++use crate::session::turn::mark_turn_phase;
+ use codex_analytics::CompactionImplementation;
+ use codex_analytics::CompactionPhase;
+ use codex_analytics::CompactionReason;
+@@ -73,6 +75,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
+     input: RemoteCompactV2AttemptInput<'_>,
+ ) -> CodexResult<RemoteCompactV2Attempt> {
+     let turn_context = &step_context.turn;
++    // Background attempts share the foreground turn store; only the foreground owns its phase.
++    let foreground = matches!(input, RemoteCompactV2AttemptInput::Foreground(_));
++    let mark = |name: &'static str| {
++        if foreground {
++            mark_turn_phase(turn_context, TurnPhase::preparation(name));
++        }
++    };
+     let mut owned_client_session = None;
+     let (
+         model_info,
+@@ -86,6 +95,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
+     ) = match input {
+         RemoteCompactV2AttemptInput::Foreground(client_session) => {
+             let model_info = turn_context.model_info();
++            mark("compaction.history_clone");
+             let mut history = sess.clone_history().await;
+             let input_goal_ids = UserGoalUpdate::message_ids(history.raw_items());
+             let tools_in_history = step_context.settings.model_info.use_responses_lite
+@@ -98,8 +108,11 @@ pub(super) async fn run_remote_compact_v2_attempt(
+                     provenance: None,
+                 }
+             } else {
++                mark("compaction.base_instructions");
+                 sess.get_prompt_base_instructions().await
+             };
++            // Synchronous over the whole history; a report here points at CPU, not a lock.
++            mark("compaction.history_trim");
+             let (rewritten_outputs, estimated_deleted_tokens) =
+                 trim_function_call_history_to_fit_context_window(
+                     &mut history,
+@@ -115,6 +128,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
+                 );
+             }
+             if estimated_deleted_tokens > 0 {
++                mark("compaction.token_estimate");
+                 let max_local_deleted_tokens = sess
+                     .estimated_tokens_after_last_model_generated_item()
+                     .await;
+@@ -125,6 +139,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
+                             .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
+                     });
+             }
++            mark("compaction.prompt_input");
+             let trace_input_history = compaction_trace
+                 .is_enabled()
+                 .then(|| history.raw_items().cloned().collect());
+@@ -184,6 +199,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
+         cyber_access_program: turn_context.cyber_access_program,
+     };
+ 
++    mark("compaction.metadata");
+     let mut responses_metadata = match captured_window {
+         Some(window) => {
+             sess.compaction_responses_metadata_for_window(turn_context, compaction_metadata, window)
+diff --git a/codex-rs/core/src/context_manager/history_tests.rs b/codex-rs/core/src/context_manager/history_tests.rs
+index 70178c446f78bb419de5699bfe0f73bd8bd63170..0426b07c97c9269e7e25b96cd5da66443316060d 100644
+--- a/codex-rs/core/src/context_manager/history_tests.rs
++++ b/codex-rs/core/src/context_manager/history_tests.rs
+@@ -2334,7 +2334,8 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
+     assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_423);
+ }
+ 
+-#[cfg_attr(not(debug_assertions), test_case::test_case(false; "local"))]
++// A local call interrupted by a stopped process or aborted turn is recovered in every build.
++#[test_case::test_case(false; "local")]
+ #[test_case::test_case(true; "inherited")]
+ fn normalize_adds_missing_output_for_custom_tool_call(inherited: bool) {
+     let items = vec![ResponseItem::CustomToolCall {
+@@ -2379,7 +2380,7 @@ fn normalize_adds_missing_output_for_custom_tool_call(inherited: bool) {
+     );
+ }
+ 
+-#[cfg_attr(not(debug_assertions), test_case::test_case(false; "local"))]
++#[test_case::test_case(false; "local")]
+ #[test_case::test_case(true; "inherited")]
+ fn normalize_adds_missing_output_for_local_shell_call_with_id(inherited: bool) {
+     let items = vec![ResponseItem::LocalShellCall {
+@@ -2732,46 +2733,6 @@ fn normalize_adds_missing_output_for_tool_search_call() {
+     );
+ }
+ 
+-#[cfg(debug_assertions)]
+-#[test]
+-#[should_panic]
+-fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
+-    let items = vec![ResponseItem::CustomToolCall {
+-        encrypted_content: None,
+-        id: None,
+-        status: None,
+-        call_id: "tool-x".to_string(),
+-        name: "custom".to_string(),
+-        namespace: None,
+-        input: "{}".to_string(),
+-        internal_chat_message_metadata_passthrough: None,
+-    }];
+-    let mut h = create_history_with_items(items);
+-    h.normalize_history(&default_input_modalities());
+-}
+-
+-#[cfg(debug_assertions)]
+-#[test]
+-#[should_panic]
+-fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() {
+-    let items = vec![ResponseItem::LocalShellCall {
+-        encrypted_content: None,
+-        id: None,
+-        call_id: Some("shell-1".to_string()),
+-        status: LocalShellStatus::Completed,
+-        action: LocalShellAction::Exec(LocalShellExecAction {
+-            command: vec!["echo".to_string(), "hi".to_string()],
+-            timeout_ms: None,
+-            working_directory: None,
+-            env: None,
+-            user: None,
+-        }),
+-        internal_chat_message_metadata_passthrough: None,
+-    }];
+-    let mut h = create_history_with_items(items);
+-    h.normalize_history(&default_input_modalities());
+-}
+-
+ #[cfg(debug_assertions)]
+ #[test]
+ #[should_panic]
+diff --git a/codex-rs/core/src/context_manager/normalize.rs b/codex-rs/core/src/context_manager/normalize.rs
+index 387bc8f75a2249be67efc44584b92585b6de57bb..37db3e42eba9463b018f0a65e4cbc50a056802e6 100644
+--- a/codex-rs/core/src/context_manager/normalize.rs
++++ b/codex-rs/core/src/context_manager/normalize.rs
+@@ -13,6 +13,7 @@ use uuid::Uuid;
+ use crate::context::ContextualUserFragment;
+ use crate::context::UnsupportedMedia;
+ use crate::util::error_or_panic;
++use tracing::error;
+ use tracing::info;
+ 
+ // Changing this value would change model-visible IDs and invalidate prompt caches.
+@@ -89,14 +90,14 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
+             {
+                 // Preserved-prefix forks mark copied calls as inherited. A call still
+                 // running in the parent has no output in the child's snapshot.
++                // A call interrupted by a stopped process or aborted turn also has none;
++                // the synthetic output below recovers it, so this must not panic the turn.
+                 if !envelope
+                     .metadata
+                     .as_ref()
+                     .is_some_and(|metadata| metadata.inherited_user_message)
+                 {
+-                    error_or_panic(format!(
+-                        "Custom tool call output is missing for call id: {call_id}"
+-                    ));
++                    error!("Custom tool call output is missing for call id: {call_id}");
+                 }
+                 missing_outputs_to_insert.push((
+                     idx,
+@@ -122,9 +123,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
+                     .as_ref()
+                     .is_some_and(|metadata| metadata.inherited_user_message)
+                 {
+-                    error_or_panic(format!(
+-                        "Local shell call output is missing for call id: {call_id}"
+-                    ));
++                    error!("Local shell call output is missing for call id: {call_id}");
+                 }
+                 missing_outputs_to_insert.push((
+                     idx,
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 96cfaa19707c13ed0bd5e7c7d3ab9f7c908226ca..3fc727a43f19f9d2a769ea0ce8cabd5b6f56f0a3 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -9,6 +9,7 @@ use std::fmt::Debug;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicU64;
++use std::time::Duration;
+ use std::time::SystemTime;
+ use std::time::UNIX_EPOCH;
+ 
+@@ -557,6 +558,10 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
+ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
+ const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
+ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
++/// Upper bound for refreshing model-visible world state before a sampling request.
++const STEP_WORLD_STATE_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
++/// Upper bound for preparing one request view, including MCP startup dependencies.
++const STEP_CONTEXT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
+ 
+ impl Session {
+     /// Spawn and initialize a new session.
+@@ -3815,15 +3820,28 @@ impl Session {
+             .await;
+     }
+ 
++    /// Refreshes model-visible world state for `step_context`.
++    ///
++    /// A stalled refresh must not hang the turn. When the turn already holds
++    /// `captured_world_state` from its start, a timed-out refresh continues
++    /// with that context and tells the user; without one it fails the request.
+     pub(crate) async fn record_step_world_state_if_changed(
+         &self,
+         step_context: &step_context::StepContext,
++        captured_world_state: Option<&Arc<WorldState>>,
+     ) -> CodexResult<Arc<WorldState>> {
+         let turn_context = step_context.turn.as_ref();
+         // Render model-visible state from the same step used to build and run tools.
+-        let world_state = self
+-            .build_world_state_for_step(step_context, /*new_window*/ false)
+-            .await?;
++        let refresh = self.build_world_state_for_step(step_context, /*new_window*/ false);
++        let world_state =
++            match tokio::time::timeout(STEP_WORLD_STATE_REFRESH_TIMEOUT, refresh).await {
++                Ok(world_state) => world_state?,
++                Err(_elapsed) => {
++                    return self
++                        .continue_with_captured_world_state(turn_context, captured_world_state)
++                        .await;
++                }
++            };
+         let (world_state_snapshot, fragments, world_state_item) = self
+             .state
+             .lock()
+@@ -3849,6 +3867,53 @@ impl Session {
+         Ok(Arc::new(world_state))
+     }
+ 
++    /// Bounds preparation that has no captured turn state to fall back to.
++    pub(crate) async fn build_world_state_for_step_bounded(
++        &self,
++        step_context: &step_context::StepContext,
++        new_window: bool,
++    ) -> CodexResult<WorldState> {
++        match tokio::time::timeout(
++            STEP_WORLD_STATE_REFRESH_TIMEOUT,
++            self.build_world_state_for_step(step_context, new_window),
++        )
++        .await
++        {
++            Ok(result) => result,
++            Err(_elapsed) => {
++                tracing::warn!(
++                    thread_id = %self.thread_id,
++                    turn_id = %step_context.turn.sub_id,
++                    "world state build timed out"
++                );
++                Err(CodexErr::RequestTimeout)
++            }
++        }
++    }
++
++    async fn continue_with_captured_world_state(
++        &self,
++        turn_context: &TurnContext,
++        captured_world_state: Option<&Arc<WorldState>>,
++    ) -> CodexResult<Arc<WorldState>> {
++        let Some(captured_world_state) = captured_world_state else {
++            return Err(CodexErr::RequestTimeout);
++        };
++        tracing::warn!(
++            thread_id = %self.thread_id,
++            turn_id = %turn_context.sub_id,
++            "step world state refresh timed out; reusing captured turn context"
++        );
++        self.send_event(
++            turn_context,
++            EventMsg::Warning(WarningEvent {
++                message: "Turn context refresh timed out. Continuing with the context captured at turn start.".to_string(),
++            }),
++        )
++        .await;
++        Ok(Arc::clone(captured_world_state))
++    }
++
+     /// Retains the step captured for execution.
+     pub(crate) async fn set_last_known_step_context(&self, step_context: &Arc<StepContext>) {
+         let turn_state = {
+@@ -3894,7 +3959,7 @@ impl Session {
+         required_plugins: &HashSet<String>,
+     ) -> CodexResult<Arc<StepContext>> {
+         let step_context = self
+-            .capture_step_context_inner(
++            .capture_step_context_inner_bounded(
+                 turn_context,
+                 cancellation_token,
+                 required_servers,
+@@ -3912,7 +3977,7 @@ impl Session {
+         turn_context: Arc<TurnContext>,
+         cancellation_token: &CancellationToken,
+     ) -> CodexResult<Arc<StepContext>> {
+-        self.capture_step_context_inner(
++        self.capture_step_context_inner_bounded(
+             turn_context,
+             cancellation_token,
+             /*required_servers*/ &[],
+@@ -3921,6 +3986,33 @@ impl Session {
+         .await
+     }
+ 
++    async fn capture_step_context_inner_bounded(
++        self: &Arc<Self>,
++        turn_context: Arc<TurnContext>,
++        cancellation_token: &CancellationToken,
++        required_servers: &[String],
++        required_plugins: &HashSet<String>,
++    ) -> CodexResult<Arc<StepContext>> {
++        let turn_id = turn_context.sub_id.to_string();
++        let capture = self.capture_step_context_inner(
++            turn_context,
++            cancellation_token,
++            required_servers,
++            required_plugins,
++        );
++        match tokio::time::timeout(STEP_CONTEXT_CAPTURE_TIMEOUT, capture).await {
++            Ok(result) => result,
++            Err(_elapsed) => {
++                tracing::warn!(
++                    thread_id = %self.thread_id,
++                    turn_id = %turn_id,
++                    "step context capture timed out"
++                );
++                Err(CodexErr::RequestTimeout)
++            }
++        }
++    }
++
+     #[expect(
+         clippy::await_holding_invalid_type,
+         reason = "step settings and both environment snapshots must be captured under active_turn then state"
+@@ -4980,7 +5072,7 @@ impl Session {
+         let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
+         let should_inject_full_context = reference_context_item.is_none();
+         let world_state = self
+-            .build_world_state_for_step(step_context, should_inject_full_context)
++            .build_world_state_for_step_bounded(step_context, should_inject_full_context)
+             .await?;
+         // Full initial context resets the baseline; later turns persist only its changes.
+         let (mut context_items, world_state_item) = if should_inject_full_context {
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 32fdf7bd27d02e3b04b26174034f5210fe94c9ce..705b31384448cdc6d668b02deec235e754e6e31e 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -148,6 +148,7 @@ use tracing::trace_span;
+ use tracing::warn;
+ 
+ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
++const TURN_DIFF_DISPLAY_ROOTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+ 
+ /// Explicit MCP startup requirements retained across restarts within one user turn.
+ #[derive(Default)]
+@@ -185,14 +186,23 @@ pub(crate) async fn run_turn(
+         .is_none();
+     let auto_summarization_enabled =
+         auto_compaction_enabled && !turn_context.config.features.enabled(Feature::TokenBudget);
++    // Names the checkpoint a silent wait is stuck behind; it never fails the turn.
++    let _phase_watch = TurnPhaseWatch::start_logging(&turn_context, sess.thread_id);
++    // Until the input reaches history, interrupt and error handling own recording it.
++    stash_unrecorded_turn_input(&turn_context.extension_data, &input);
+     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
+         crate::guardian::check_pending_guardian_input(&sess, &turn_context).await?;
+     }
+     // Record results from hooks that finished after the previous turn before this turn's user prompt.
++    mark_turn_phase(&turn_context, TurnPhase::preparation("turn.async_hooks"));
+     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
+ 
+     let mut client_session =
+         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("turn.pre_sampling_compaction"),
++    );
+     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
+     // new user message are recorded. Estimate pending incoming items (context
+     // diffs/full reinjection + user input) and trigger compaction preemptively
+@@ -207,6 +217,7 @@ pub(crate) async fn run_turn(
+         .await
+     {
+         // Compaction runs before the new input is recorded, so preserve it on every failure.
++        take_unrecorded_turn_input(&turn_context.extension_data);
+         run_hooks_and_record_inputs(
+             &sess,
+             &turn_context,
+@@ -249,6 +260,10 @@ pub(crate) async fn run_turn(
+     if allow_plugin_mentions {
+         required_plugins.extend(crate::plugins::collect_explicit_plugin_ids(&user_input));
+     }
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("turn.mcp_requirements"),
++    );
+     let (input_required_servers, mentioned_plugins) =
+         match required_mcp_servers_for_input(&sess, turn_context.as_ref(), &user_input)
+             .or_cancel(&cancellation_token)
+@@ -256,14 +271,7 @@ pub(crate) async fn run_turn(
+         {
+             Ok(requirements) => requirements,
+             Err(err) => {
+-                run_hooks_and_record_inputs(
+-                    &sess,
+-                    &turn_context,
+-                    &turn_context.capture_current_model_info(),
+-                    &input,
+-                    PersistContext::Standard,
+-                )
+-                .await;
++                record_input_after_preparation_error(&sess, &turn_context, &input).await;
+                 return Err(err.into());
+             }
+         };
+@@ -273,6 +281,7 @@ pub(crate) async fn run_turn(
+     required_servers.dedup();
+ 
+     // run_turn owns the step used to seed context and make the first sampling request.
++    mark_turn_phase(&turn_context, TurnPhase::preparation("turn.step_capture"));
+     let first_step_context = match sess
+         .capture_step_context_with_required_mcp_servers(
+             Arc::clone(&turn_context),
+@@ -283,20 +292,16 @@ pub(crate) async fn run_turn(
+         .await
+     {
+         Ok(step_context) => step_context,
+-        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+-            run_hooks_and_record_inputs(
+-                &sess,
+-                &turn_context,
+-                &turn_context.capture_current_model_info(),
+-                &input,
+-                PersistContext::Standard,
+-            )
+-            .await;
++        Err(err) => {
++            record_input_after_preparation_error(&sess, &turn_context, &input).await;
+             return Err(err);
+         }
+-        Err(err) => return Err(err),
+     };
+     // Record initial context while preparing diff display roots.
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("turn.initial_context"),
++    );
+     let (record_context, display_roots) = tokio::join!(
+         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
+         async {
+@@ -319,12 +324,46 @@ pub(crate) async fn run_turn(
+                     })
+                     .collect()
+             } else {
+-                turn_diff_display_roots(first_step_context.as_ref()).await
++                match tokio::time::timeout(
++                    TURN_DIFF_DISPLAY_ROOTS_TIMEOUT,
++                    turn_diff_display_roots(first_step_context.as_ref()),
++                )
++                .await
++                {
++                    Ok(roots) => roots,
++                    Err(_) => {
++                        tracing::warn!(
++                            thread_id = %sess.thread_id,
++                            turn_id = %turn_context.sub_id,
++                            "turn diff display root discovery timed out; using environment cwd"
++                        );
++                        first_step_context
++                            .environments
++                            .turn_environments()
++                            .map(|environment| {
++                                (
++                                    environment.selection().environment_id,
++                                    environment.cwd().clone(),
++                                )
++                            })
++                            .collect()
++                    }
++                }
+             }
+         },
+     );
+-    let mut world_state = record_context?;
++    let mut world_state = match record_context {
++        Ok(world_state) => world_state,
++        Err(err) => {
++            record_input_after_preparation_error(&sess, &turn_context, &input).await;
++            return Err(err);
++        }
++    };
+ 
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("turn.skills_and_plugins"),
++    );
+     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
+         &sess,
+         first_step_context.as_ref(),
+@@ -337,6 +376,10 @@ pub(crate) async fn run_turn(
+         return Ok(None);
+     };
+ 
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("turn.session_start_hooks"),
++    );
+     if run_pending_session_start_hooks(&sess, &turn_context).await {
+         return Ok(None);
+     }
+@@ -361,7 +404,7 @@ pub(crate) async fn run_turn(
+         sess.services
+             .thread_extension_data
+             .insert(crate::guardian::ExhaustedReviewBudget::Compacting);
+-        run_auto_compact(
++        let compact_result = run_auto_compact(
+             &sess,
+             Arc::clone(&first_step_context),
+             Arc::clone(&first_step_context),
+@@ -370,10 +413,21 @@ pub(crate) async fn run_turn(
+             CompactionPhase::PreTurn,
+             /*candidate*/ None,
+         )
+-        .await?;
+-        world_state = sess
++        .await;
++        if let Err(err) = compact_result {
++            record_input_after_preparation_error(&sess, &turn_context, &input).await;
++            return Err(err);
++        }
++        let refreshed_world_state = sess
+             .record_context_updates_and_set_reference_context_item(first_step_context.as_ref())
+-            .await?;
++            .await;
++        world_state = match refreshed_world_state {
++            Ok(world_state) => world_state,
++            Err(err) => {
++                record_input_after_preparation_error(&sess, &turn_context, &input).await;
++                return Err(err);
++            }
++        };
+         crate::guardian::finalize_guardian_input(
+             &sess,
+             &first_step_context,
+@@ -383,6 +437,8 @@ pub(crate) async fn run_turn(
+         .await?;
+     }
+     let mut can_drain_pending_input = input.is_empty();
++    // From here this turn records its own input, including when hooks block it.
++    take_unrecorded_turn_input(&turn_context.extension_data);
+     if run_hooks_and_record_inputs(
+         &sess,
+         &turn_context,
+@@ -461,6 +517,7 @@ pub(crate) async fn run_turn(
+         // Note that pending_input would be something like a message the user
+         // submitted through the UI while the model was running. Though the UI
+         // may support this, the model might not.
++        mark_turn_phase(&turn_context, TurnPhase::preparation("step.pending_input"));
+         let pending_input = if can_drain_pending_input {
+             sess.input_queue
+                 .get_pending_input(&sess.active_turn)
+@@ -493,6 +550,10 @@ pub(crate) async fn run_turn(
+         .await;
+ 
+         // Capture once so context, advertised tools, and tool calls share one request view.
++        // Only the step captured at turn start may fall back to the turn-start world state.
++        let may_reuse_captured_world_state =
++            next_step_context.is_some() && pending_input.is_empty();
++        mark_turn_phase(&turn_context, TurnPhase::preparation("step.capture"));
+         let step_context = match next_step_context.take() {
+             Some(step_context) if pending_input.is_empty() => step_context,
+             None if pending_input.is_empty() => {
+@@ -531,6 +592,7 @@ pub(crate) async fn run_turn(
+             }
+         };
+         let sampling_request_result: CodexResult<_> = async {
++            mark_turn_phase(&turn_context, TurnPhase::preparation("step.time_reminder"));
+             super::time_reminder::maybe_record_current_time_reminder(
+                 sess.as_ref(),
+                 turn_context.as_ref(),
+@@ -538,8 +600,10 @@ pub(crate) async fn run_turn(
+             )
+             .await?;
+ 
++            mark_turn_phase(&turn_context, TurnPhase::preparation("step.world_state"));
++            let captured_world_state = may_reuse_captured_world_state.then_some(&world_state);
+             world_state = sess
+-                .record_step_world_state_if_changed(step_context.as_ref())
++                .record_step_world_state_if_changed(step_context.as_ref(), captured_world_state)
+                 .await?;
+ 
+             // Isolated Guardian reviewers deliberately have no skill catalog.
+@@ -552,10 +616,12 @@ pub(crate) async fn run_turn(
+             }
+ 
+             // Keep the override after accepted input so history truncation removes them together.
++            mark_turn_phase(&turn_context, TurnPhase::preparation("step.request_input"));
+             sess.record_reasoning_effort_override(step_context.as_ref())
+                 .await;
+ 
+             // Construct the input that we will send to the model.
++            mark_turn_phase(&turn_context, TurnPhase::preparation("step.history_clone"));
+             let sampling_request_input: Vec<ResponseItem> = async {
+                 sess.clone_history()
+                     .await
+@@ -593,6 +659,7 @@ pub(crate) async fn run_turn(
+                 }
+                 can_drain_pending_input = true;
+                 // Process async hooks only after sampling and its tools have finished.
++                mark_turn_phase(&turn_context, TurnPhase::preparation("step.post_sampling"));
+                 drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ false).await;
+                 let (has_pending_input, token_status) = async {
+                     let has_pending_input =
+@@ -911,6 +978,97 @@ pub(crate) async fn run_turn(
+     Ok(last_agent_message)
+ }
+ 
++async fn record_input_after_preparation_error(
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
++    input: &[TurnInput],
++) {
++    // This path records the input itself; interrupt and error handling must not repeat it.
++    take_unrecorded_turn_input(&turn_context.extension_data);
++    run_hooks_and_record_inputs(
++        sess,
++        turn_context,
++        &turn_context.capture_current_model_info(),
++        input,
++        PersistContext::Standard,
++    )
++    .await;
++}
++
++/// Turn input accepted by `run_turn` but not yet written to history.
++///
++/// Pre-turn compaction and step preparation run before the input is recorded.
++/// If that preparation is interrupted or fails, the task is dropped before it
++/// can record the input, so the finishing paths record what remains here.
++pub(crate) struct UnrecordedTurnInput {
++    input: std::sync::Mutex<Option<Vec<TurnInput>>>,
++}
++
++impl UnrecordedTurnInput {
++    fn new(input: Vec<TurnInput>) -> Self {
++        Self {
++            input: std::sync::Mutex::new(Some(input)),
++        }
++    }
++
++    fn take(&self) -> Option<Vec<TurnInput>> {
++        self.input
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take()
++    }
++}
++
++pub(crate) fn stash_unrecorded_turn_input(
++    turn_store: &codex_extension_api::ExtensionData,
++    input: &[TurnInput],
++) {
++    if input.is_empty() {
++        turn_store.remove::<UnrecordedTurnInput>();
++        return;
++    }
++    turn_store.insert(UnrecordedTurnInput::new(input.to_vec()));
++}
++
++pub(crate) fn take_unrecorded_turn_input(
++    turn_store: &codex_extension_api::ExtensionData,
++) -> Option<Vec<TurnInput>> {
++    turn_store.remove::<UnrecordedTurnInput>()?.take()
++}
++
++/// Records input that a dropped or failed turn never wrote, without rerunning
++/// prompt hooks: the turn is already finishing and hooks may be what stalled.
++pub(crate) async fn record_unrecorded_turn_input(
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
++) -> bool {
++    let Some(input) = take_unrecorded_turn_input(&turn_context.extension_data) else {
++        return false;
++    };
++    // Only finalized evidence may enter reusable Guardian reviewer history.
++    if sess
++        .services
++        .thread_extension_data
++        .get::<crate::guardian::PendingReviewContext>()
++        .is_some()
++    {
++        return false;
++    }
++    let model_info = turn_context.capture_current_model_info();
++    for input_item in input {
++        crate::hook_runtime::record_pending_input(
++            sess,
++            turn_context,
++            &model_info,
++            input_item,
++            Vec::new(),
++            PersistContext::Standard,
++        )
++        .await;
++    }
++    true
++}
++
+ #[instrument(level = "trace", skip_all)]
+ async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, PathUri)> {
+     let mut display_roots = Vec::new();
+@@ -1526,9 +1684,21 @@ async fn run_auto_compact(
+     {
+         return Ok(false);
+     }
++    mark_turn_phase(
++        turn_context,
++        TurnPhase::preparation("compaction.world_state"),
++    );
+     let world_state = Arc::new(
+-        sess.build_world_state_for_step(&replacement_step_context, /*new_window*/ true)
+-            .await?,
++        sess.build_world_state_for_step_bounded(
++            &replacement_step_context,
++            /*new_window*/ true,
++        )
++        .await?,
++    );
++    // The bounded build returned; later compaction preparation is tracked separately.
++    mark_turn_phase(
++        turn_context,
++        TurnPhase::preparation("compaction.after_world_state"),
+     );
+     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
+     let _compaction_span = trace_span!(
+@@ -1540,6 +1710,10 @@ async fn run_auto_compact(
+     if turn_context.config.features.enabled(Feature::TokenBudget) {
+         // Compaction is the reset request, so force a new context window
+         // instead of consuming a pending `new_context` tool request.
++        mark_turn_phase(
++            turn_context,
++            TurnPhase::preparation("compaction.token_budget_task"),
++        );
+         crate::compact_token_budget::run_inline_auto_compact_task(
+             Arc::clone(sess),
+             replacement_step_context,
+@@ -1560,6 +1734,10 @@ async fn run_auto_compact(
+                 );
+             }
+             let fallback = if has_candidate && matches!(reason, CompactionReason::ContextLimit) {
++                mark_turn_phase(
++                    turn_context,
++                    TurnPhase::preparation("compaction.token_status"),
++                );
+                 let status =
+                     super::context_window::context_window_token_status(sess, turn_context).await;
+                 let required = match phase {
+@@ -1576,6 +1754,7 @@ async fn run_auto_compact(
+             } else {
+                 crate::compact_remote_v2::CompactionFallback::Foreground
+             };
++            mark_turn_phase(turn_context, TurnPhase::preparation("compaction.v2_task"));
+             let installed = run_inline_remote_auto_compact_task_v2(
+                 Arc::clone(sess),
+                 step_context,
+@@ -1720,6 +1899,7 @@ async fn run_sampling_request(
+     cancellation_token: CancellationToken,
+ ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+     let turn_context = Arc::clone(&step_context.turn);
++    mark_turn_phase(&turn_context, TurnPhase::preparation("sampling.prepare"));
+     let preempt = step_context.preempt.clone().unwrap_or_default();
+     let _input_watch = if let Some(preempt) = &step_context.preempt {
+         sess.input_queue
+@@ -1728,8 +1908,16 @@ async fn run_sampling_request(
+     } else {
+         None
+     };
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.base_instructions"),
++    );
+     let base_instructions = sess.get_prompt_base_instructions().await;
+ 
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.tool_runtime"),
++    );
+     let tool_runtime = ToolCallRuntime::new(
+         Arc::clone(&sess),
+         Arc::clone(&step_context),
+@@ -1741,6 +1929,10 @@ async fn run_sampling_request(
+         Arc::clone(&turn_diff_tracker),
+     );
+     let max_retries = turn_context.provider.info().stream_max_retries();
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.incremental_tools"),
++    );
+     let incremental_tools = sess
+         .current_window_uses_incremental_tools(&step_context)
+         .await;
+@@ -1754,6 +1946,7 @@ async fn run_sampling_request(
+     let mut original_input = None;
+     let mut executed_tool_calls_by_output = HashMap::new();
+     loop {
++        mark_turn_phase(&turn_context, TurnPhase::preparation("sampling.prompt"));
+         // Running code-mode cells can request review while this response is in flight.
+         // Keep the latest received ID until response.created replaces it.
+         let prompt_input = if let Some(input) = initial_input.take() {
+@@ -1773,6 +1966,7 @@ async fn run_sampling_request(
+             base_instructions.clone(),
+             incremental_tools,
+         );
++        mark_turn_phase(&turn_context, TurnPhase::preparation("sampling.metadata"));
+         let responses_metadata = sess
+             .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
+             .await;
+@@ -1786,6 +1980,8 @@ async fn run_sampling_request(
+             .await?;
+         }
+         let mut draining_for_mailbox = false;
++        // The request is not sent yet; try_run_sampling_request marks model work after sending.
++        mark_turn_phase(&turn_context, TurnPhase::preparation("sampling.try_run"));
+         let err = match try_run_sampling_request(
+             tool_runtime.clone(),
+             Arc::clone(&sess),
+@@ -2660,6 +2856,10 @@ async fn try_run_sampling_request(
+             step_context.settings.service_tier.as_deref(),
+         ))),
+     );
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.after_feedback_tags"),
++    );
+     let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
+         turn_context.sub_id.as_str(),
+         step_context.settings.model_info.slug.as_str(),
+@@ -2681,6 +2881,10 @@ async fn try_run_sampling_request(
+         .enabled(Feature::ConcurrentReasoningSummaries)
+         && turn_context.provider.info().is_openai();
+     let mut preempt = step_context.preempt.clone().unwrap_or_default();
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.reasoning_effort"),
++    );
+     let effort = sess
+         .reasoning_effort_for_request(&step_context.settings, super::RequestEffortUsage::Sampling)
+         .await;
+@@ -2717,13 +2921,26 @@ async fn try_run_sampling_request(
+         .execution_mode_for_event(HookEventName::PreModelRequest)
+         .is_some()
+     {
++        mark_turn_phase(
++            &turn_context,
++            TurnPhase::preparation("sampling.pre_model_request_hooks"),
++        );
+         run_model_request_hooks(&sess, &step_context, &hooks, PreModelRequest).await;
+     }
+     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
+     let mut response_completed = false;
+     let mut request_token_usage = None;
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.server_reasoning_flag"),
++    );
+     sess.set_server_reasoning_included(step_context.settings.model_info.use_responses_lite)
+         .await;
++    // Sending ends at the first response boundary; only what follows is model work.
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::preparation("sampling.request_send"),
++    );
+     let mut stream = match client_session
+         .stream(
+             prompt,
+@@ -2752,6 +2969,11 @@ async fn try_run_sampling_request(
+             return Err(error);
+         }
+     };
++    // Reasoning, streaming, and tool execution may legitimately run for a long time.
++    mark_turn_phase(
++        &turn_context,
++        TurnPhase::model_work("sampling.model_stream"),
++    );
+     if cancellation_token.is_cancelled() {
+         return Err(CodexErr::TurnAborted);
+     }
+@@ -3449,6 +3671,174 @@ pub(crate) fn get_last_assistant_message_from_turn<'a>(
+     None
+ }
+ 
++/// A preparation phase that has not advanced for this long is reported once,
++/// then again on every repeat interval while it keeps waiting.
++const TURN_PHASE_STALL_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
++const TURN_PHASE_STALL_REPORT_REPEAT: std::time::Duration = std::time::Duration::from_secs(300);
++const TURN_PHASE_WATCH_POLL: std::time::Duration = std::time::Duration::from_secs(5);
++
++/// Whether time spent in a phase can be legitimate model work.
++///
++/// Model streaming, tool execution, and compaction requests may run for a long
++/// time, so they are never reported. Preparation phases wait only on local
++/// state, locks, or startup work; a long wait there is a silent stall.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum TurnPhaseKind {
++    Preparation,
++    ModelWork,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct TurnPhase {
++    pub(crate) name: &'static str,
++    pub(crate) kind: TurnPhaseKind,
++}
++
++impl TurnPhase {
++    pub(crate) const fn preparation(name: &'static str) -> Self {
++        Self {
++            name,
++            kind: TurnPhaseKind::Preparation,
++        }
++    }
++
++    pub(crate) const fn model_work(name: &'static str) -> Self {
++        Self {
++            name,
++            kind: TurnPhaseKind::ModelWork,
++        }
++    }
++}
++
++struct TurnPhaseState {
++    phase: TurnPhase,
++    entered_at: tokio::time::Instant,
++    last_reported_at: Option<tokio::time::Instant>,
++}
++
++/// Last checkpoint a turn reached, shared through the turn's extension store so
++/// compaction and sampling helpers can advance it without new parameters.
++pub(crate) struct TurnPhaseMarker {
++    state: std::sync::Mutex<TurnPhaseState>,
++}
++
++impl TurnPhaseMarker {
++    fn new(phase: TurnPhase) -> Self {
++        Self {
++            state: std::sync::Mutex::new(TurnPhaseState {
++                phase,
++                entered_at: tokio::time::Instant::now(),
++                last_reported_at: None,
++            }),
++        }
++    }
++
++    fn enter(&self, phase: TurnPhase) {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        *state = TurnPhaseState {
++            phase,
++            entered_at: tokio::time::Instant::now(),
++            last_reported_at: None,
++        };
++    }
++
++    fn take_stall(&self, now: tokio::time::Instant) -> Option<TurnPhaseStall> {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        if state.phase.kind != TurnPhaseKind::Preparation {
++            return None;
++        }
++        let waited = now.saturating_duration_since(state.entered_at);
++        let due = match state.last_reported_at {
++            None => waited >= TURN_PHASE_STALL_REPORT_AFTER,
++            Some(reported_at) => {
++                now.saturating_duration_since(reported_at) >= TURN_PHASE_STALL_REPORT_REPEAT
++            }
++        };
++        if !due {
++            return None;
++        }
++        state.last_reported_at = Some(now);
++        Some(TurnPhaseStall {
++            phase: state.phase.name,
++            waited,
++        })
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) struct TurnPhaseStall {
++    pub(crate) phase: &'static str,
++    pub(crate) waited: std::time::Duration,
++}
++
++/// Records the checkpoint at TRACE level and advances the turn's stall watch.
++pub(crate) fn mark_turn_phase(turn_context: &TurnContext, phase: TurnPhase) {
++    trace!(turn_id = %turn_context.sub_id, phase = phase.name, "turn phase entered");
++    advance_turn_phase(&turn_context.extension_data, phase);
++}
++
++fn advance_turn_phase(turn_store: &codex_extension_api::ExtensionData, phase: TurnPhase) {
++    if let Some(marker) = turn_store.get::<TurnPhaseMarker>() {
++        marker.enter(phase);
++    }
++}
++
++/// Reports, without failing the turn, a preparation phase that stops advancing.
++struct TurnPhaseWatch {
++    task: tokio::task::JoinHandle<()>,
++}
++
++impl TurnPhaseWatch {
++    fn start(
++        turn_store: &codex_extension_api::ExtensionData,
++        report: impl Fn(TurnPhaseStall) + Send + Sync + 'static,
++    ) -> Self {
++        turn_store.insert(TurnPhaseMarker::new(TurnPhase::preparation("turn.start")));
++        let marker = turn_store.get::<TurnPhaseMarker>();
++        let task = tokio::spawn(async move {
++            let Some(marker) = marker else {
++                return;
++            };
++            loop {
++                tokio::time::sleep(TURN_PHASE_WATCH_POLL).await;
++                if let Some(stall) = marker.take_stall(tokio::time::Instant::now()) {
++                    report(stall);
++                }
++            }
++        });
++        Self { task }
++    }
++
++    fn start_logging(turn_context: &TurnContext, thread_id: codex_protocol::ThreadId) -> Self {
++        let turn_id = turn_context.sub_id.clone();
++        Self::start(&turn_context.extension_data, move |stall| {
++            warn!(
++                %thread_id,
++                turn_id = %turn_id,
++                phase = stall.phase,
++                waited_secs = stall.waited.as_secs(),
++                "turn phase has not advanced; still waiting"
++            );
++        })
++    }
++}
++
++impl Drop for TurnPhaseWatch {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++
+ #[cfg(test)]
+ #[path = "turn_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "turn_phase_watch_tests.rs"]
++mod turn_phase_watch_tests;
+diff --git a/codex-rs/core/src/session/turn_phase_watch_tests.rs b/codex-rs/core/src/session/turn_phase_watch_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..362f95305a926e8e8b13f8a26cbf06d5f982ccdd
+--- /dev/null
++++ b/codex-rs/core/src/session/turn_phase_watch_tests.rs
+@@ -0,0 +1,86 @@
++use super::*;
++use codex_extension_api::ExtensionData;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++
++fn recording_watch(store: &ExtensionData) -> (TurnPhaseWatch, Arc<Mutex<Vec<TurnPhaseStall>>>) {
++    let reports = Arc::new(Mutex::new(Vec::new()));
++    let sink = Arc::clone(&reports);
++    let watch = TurnPhaseWatch::start(store, move |stall| {
++        sink.lock().expect("report sink").push(stall);
++    });
++    (watch, reports)
++}
++
++fn reported_phases(reports: &Mutex<Vec<TurnPhaseStall>>) -> Vec<&'static str> {
++    reports
++        .lock()
++        .expect("report sink")
++        .iter()
++        .map(|stall| stall.phase)
++        .collect()
++}
++
++#[tokio::test(start_paused = true)]
++async fn stalled_preparation_phase_is_reported_by_name_and_repeated() {
++    let store = ExtensionData::new("turn");
++    let (_watch, reports) = recording_watch(&store);
++    advance_turn_phase(&store, TurnPhase::preparation("step.world_state"));
++
++    tokio::time::sleep(Duration::from_secs(55)).await;
++    assert_eq!(reported_phases(&reports), Vec::<&str>::new());
++
++    tokio::time::sleep(Duration::from_secs(10)).await;
++    assert_eq!(reported_phases(&reports), vec!["step.world_state"]);
++    let first_wait = reports.lock().expect("report sink")[0].waited;
++    assert!(first_wait >= TURN_PHASE_STALL_REPORT_AFTER);
++
++    // One report per repeat interval, not one per poll.
++    tokio::time::sleep(Duration::from_secs(240)).await;
++    assert_eq!(reported_phases(&reports).len(), 1);
++    tokio::time::sleep(Duration::from_secs(70)).await;
++    assert_eq!(
++        reported_phases(&reports),
++        vec!["step.world_state", "step.world_state"]
++    );
++}
++
++#[tokio::test(start_paused = true)]
++async fn long_model_work_is_not_reported_and_next_preparation_starts_fresh() {
++    let store = ExtensionData::new("turn");
++    let (_watch, reports) = recording_watch(&store);
++    advance_turn_phase(&store, TurnPhase::model_work("sampling.model"));
++
++    tokio::time::sleep(Duration::from_secs(60 * 60)).await;
++    assert_eq!(reported_phases(&reports), Vec::<&str>::new());
++
++    advance_turn_phase(&store, TurnPhase::preparation("step.post_sampling"));
++    tokio::time::sleep(Duration::from_secs(30)).await;
++    assert_eq!(reported_phases(&reports), Vec::<&str>::new());
++    tokio::time::sleep(Duration::from_secs(35)).await;
++    assert_eq!(reported_phases(&reports), vec!["step.post_sampling"]);
++}
++
++#[tokio::test(start_paused = true)]
++async fn advancing_phase_resets_the_stall_clock() {
++    let store = ExtensionData::new("turn");
++    let (_watch, reports) = recording_watch(&store);
++    for phase in ["step.capture", "step.time_reminder", "step.world_state"] {
++        advance_turn_phase(&store, TurnPhase::preparation(phase));
++        tokio::time::sleep(Duration::from_secs(50)).await;
++    }
++    assert_eq!(reported_phases(&reports), Vec::<&str>::new());
++}
++
++#[tokio::test(start_paused = true)]
++async fn dropping_the_watch_stops_reports() {
++    let store = ExtensionData::new("turn");
++    let (watch, reports) = recording_watch(&store);
++    advance_turn_phase(&store, TurnPhase::preparation("turn.step_capture"));
++    drop(watch);
++
++    tokio::time::sleep(Duration::from_secs(10 * 60)).await;
++    assert_eq!(reported_phases(&reports), Vec::<&str>::new());
++}
+diff --git a/codex-rs/core/src/tasks/compact.rs b/codex-rs/core/src/tasks/compact.rs
+index 6014a2d7f76098f0b8d48b92a8e77fe0bfe388c6..e618e292f34443d6bac8874e0b3403577286fae2 100644
+--- a/codex-rs/core/src/tasks/compact.rs
++++ b/codex-rs/core/src/tasks/compact.rs
+@@ -47,7 +47,7 @@ impl SessionTask for CompactTask {
+             .await?;
+         let world_state = Arc::new(
+             session
+-                .build_world_state_for_step(&step_context, /*new_window*/ true)
++                .build_world_state_for_step_bounded(&step_context, /*new_window*/ true)
+                 .await?,
+         );
+         if ctx.config.features.enabled(Feature::TokenBudget) {
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index 0db73d95dcbfe914472c90ddd256aaee56eb6ec3..4ddffbdd5848f30ac477ad14c353dd3ea7df70ea 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -11,7 +11,9 @@ use std::time::Instant;
+ use codex_diagnostics::Gauge;
+ use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
+ use codex_extension_api::ThreadIdleCause;
++use futures::FutureExt;
+ use futures::future::BoxFuture;
++use std::panic::AssertUnwindSafe;
+ use tokio::select;
+ use tokio::sync::Mutex;
+ use tokio::sync::Notify;
+@@ -19,6 +21,7 @@ use tokio_util::sync::CancellationToken;
+ use tokio_util::task::AbortOnDropHandle;
+ use tracing::Instrument;
+ use tracing::Span;
++use tracing::error;
+ use tracing::field;
+ use tracing::info_span;
+ use tracing::trace;
+@@ -31,6 +34,7 @@ use crate::context::ContextualUserFragment;
+ use crate::hook_runtime::run_turn_interrupt_hooks;
+ use crate::session::TurnInput;
+ use crate::session::session::Session;
++use crate::session::turn::record_unrecorded_turn_input;
+ use crate::session::turn::run_hooks_and_record_inputs;
+ use crate::session::turn_context::NewTurnContextOptions;
+ use crate::session::turn_context::TurnContext;
+@@ -60,6 +64,7 @@ use codex_protocol::protocol::WarningEvent;
+ use codex_thread_store::PersistContext;
+ 
+ use codex_features::Feature;
++use codex_protocol::error::CodexErr;
+ use codex_protocol::error::CodexErrorDetails;
+ use codex_protocol::error::Result as CodexResult;
+ pub(crate) use compact::CompactTask;
+@@ -384,15 +389,21 @@ impl Session {
+         let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+         let task_future = async move {
+             let ctx_for_finish = Arc::clone(&ctx);
+-            let task_result = task_for_run
+-                .run(
+-                    Arc::clone(&session),
+-                    ctx,
+-                    task_input,
+-                    task_cancellation_token.child_token(),
+-                )
+-                .instrument(trace_span!("session_task.run"))
+-                .await;
++            // A panic inside the task must still finish the turn below; otherwise the
++            // RunningTask stays registered and clients wait on the turn forever.
++            let task_result = AssertUnwindSafe(
++                task_for_run
++                    .run(
++                        Arc::clone(&session),
++                        ctx,
++                        task_input,
++                        task_cancellation_token.child_token(),
++                    )
++                    .instrument(trace_span!("session_task.run")),
++            )
++            .catch_unwind()
++            .await
++            .unwrap_or_else(|payload| Err(task_panic_error(payload.as_ref())));
+             let sess = Arc::clone(&session);
+             // Private reviewers save their transcript together with the terminal event.
+             // Errors and cancellation retain their existing save path.
+@@ -647,6 +658,10 @@ impl Session {
+         turn_context: Arc<TurnContext>,
+         task_result: SessionTaskResult,
+     ) {
++        if task_result.is_err() {
++            // A failed preparation phase must not drop input the user already submitted.
++            record_unrecorded_turn_input(self, &turn_context).await;
++        }
+         let (last_agent_message, abort_reason) = match task_result {
+             Ok(last_agent_message) => (last_agent_message, None),
+             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+@@ -987,6 +1002,9 @@ impl Session {
+             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
+             .await;
+ 
++        // The dropped task can no longer record input it accepted; keep it ahead of the marker.
++        record_unrecorded_turn_input(self, &task.turn_context).await;
++
+         if reason == TurnAbortReason::Interrupted
+             && let Some(marker) = interrupted_turn_history_marker(
+                 InterruptedTurnHistoryMarker::from_config_and_version(
+@@ -1048,6 +1066,21 @@ impl Session {
+     }
+ }
+ 
++/// Converts a task panic into the turn's terminal error, so the normal finish path runs.
++fn task_panic_error(payload: &(dyn std::any::Any + Send)) -> CodexErr {
++    let message = payload
++        .downcast_ref::<String>()
++        .map(String::as_str)
++        .or_else(|| payload.downcast_ref::<&str>().copied())
++        .unwrap_or("non-string panic payload");
++    error!("session task panicked: {message}");
++    CodexErr::Fatal(format!("turn task panicked: {message}"))
++}
++
+ #[cfg(test)]
+ #[path = "mod_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "unrecorded_input_tests.rs"]
++mod unrecorded_input_tests;
+diff --git a/codex-rs/core/src/tasks/unrecorded_input_tests.rs b/codex-rs/core/src/tasks/unrecorded_input_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f990397865523cc91f85b067ac96b306a112a191
+--- /dev/null
++++ b/codex-rs/core/src/tasks/unrecorded_input_tests.rs
+@@ -0,0 +1,252 @@
++//! A turn accepts user input before preparation (pre-turn compaction, step capture,
++//! initial context) has finished. Interrupting or failing during that window must still
++//! leave the input in history, exactly once and ahead of the interrupt marker.
++
++use super::SessionTask;
++use super::SessionTaskResult;
++use crate::session::TurnInput;
++use crate::session::UserInputMetadata;
++use crate::session::session::Session;
++use crate::session::tests::make_session_and_context_with_rx;
++use crate::session::turn::UnrecordedTurnInput;
++use crate::session::turn::stash_unrecorded_turn_input;
++use crate::session::turn::take_unrecorded_turn_input;
++use crate::session::turn_context::TurnContext;
++use crate::state::TaskKind;
++use codex_protocol::error::CodexErr;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::TurnAbortReason;
++use codex_protocol::user_input::UserInput;
++use pretty_assertions::assert_eq;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio_util::sync::CancellationToken;
++
++const SUBMITTED_TEXT: &str = "keep this request across an interrupted preparation";
++
++/// Holds input like `run_turn` does before it is recorded, then stops or fails there.
++struct StalledPreparationTask {
++    fail: bool,
++}
++
++impl SessionTask for StalledPreparationTask {
++    fn kind(&self) -> TaskKind {
++        TaskKind::Regular
++    }
++
++    fn span_name(&self) -> &'static str {
++        "session_task.stalled_preparation"
++    }
++
++    async fn run(
++        self: Arc<Self>,
++        _session: Arc<Session>,
++        turn_context: Arc<TurnContext>,
++        input: Vec<TurnInput>,
++        _cancellation_token: CancellationToken,
++    ) -> SessionTaskResult {
++        stash_unrecorded_turn_input(&turn_context.extension_data, &input);
++        if self.fail {
++            return Err(CodexErr::Fatal("preparation failed".to_string()));
++        }
++        std::future::pending().await
++    }
++}
++
++/// Panics after holding its input, like a debug-build invariant check inside a turn.
++struct PanickingPreparationTask;
++
++impl SessionTask for PanickingPreparationTask {
++    fn kind(&self) -> TaskKind {
++        TaskKind::Regular
++    }
++
++    fn span_name(&self) -> &'static str {
++        "session_task.panicking_preparation"
++    }
++
++    async fn run(
++        self: Arc<Self>,
++        _session: Arc<Session>,
++        turn_context: Arc<TurnContext>,
++        input: Vec<TurnInput>,
++        _cancellation_token: CancellationToken,
++    ) -> SessionTaskResult {
++        stash_unrecorded_turn_input(&turn_context.extension_data, &input);
++        panic!("simulated invariant failure in turn task");
++    }
++}
++
++fn submitted_input() -> Vec<TurnInput> {
++    vec![TurnInput::UserInput {
++        content: vec![UserInput::Text {
++            text: SUBMITTED_TEXT.to_string(),
++            text_elements: Vec::new(),
++        }],
++        client_id: None,
++        metadata: UserInputMetadata::default(),
++    }]
++}
++
++async fn user_message_texts(session: &Session) -> Vec<String> {
++    session
++        .clone_history()
++        .await
++        .raw_items()
++        .filter_map(|item| match item {
++            ResponseItem::Message { role, content, .. } if role == "user" => Some(
++                content
++                    .iter()
++                    .filter_map(|content| match content {
++                        ContentItem::InputText { text } => Some(text.as_str()),
++                        _ => None,
++                    })
++                    .collect::<String>(),
++            ),
++            _ => None,
++        })
++        .collect()
++}
++
++fn submitted_positions(texts: &[String]) -> Vec<usize> {
++    texts
++        .iter()
++        .enumerate()
++        .filter(|(_, text)| text.contains(SUBMITTED_TEXT))
++        .map(|(index, _)| index)
++        .collect()
++}
++
++async fn wait_until_input_is_held(turn_context: &TurnContext) {
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while turn_context
++            .extension_data
++            .get::<UnrecordedTurnInput>()
++            .is_none()
++        {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("task should hold its input before stalling");
++}
++
++#[tokio::test]
++async fn interrupt_during_preparation_records_input_once_before_marker() {
++    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
++    session
++        .spawn_task(
++            Arc::clone(&turn_context),
++            submitted_input(),
++            StalledPreparationTask { fail: false },
++        )
++        .await;
++    wait_until_input_is_held(&turn_context).await;
++
++    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++
++    let texts = user_message_texts(&session).await;
++    let submitted = submitted_positions(&texts);
++    assert_eq!(
++        submitted.len(),
++        1,
++        "input must be recorded exactly once: {texts:?}"
++    );
++    if let Some(marker) = texts
++        .iter()
++        .position(|text| text.contains("<turn_aborted>"))
++    {
++        assert!(
++            submitted[0] < marker,
++            "input must precede the interrupt marker: {texts:?}"
++        );
++    }
++    assert!(
++        turn_context
++            .extension_data
++            .get::<UnrecordedTurnInput>()
++            .is_none()
++    );
++}
++
++#[tokio::test]
++async fn failed_preparation_records_input() {
++    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
++    session
++        .spawn_task(
++            Arc::clone(&turn_context),
++            submitted_input(),
++            StalledPreparationTask { fail: true },
++        )
++        .await;
++
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while submitted_positions(&user_message_texts(&session).await).is_empty() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("failed turn should record its submitted input");
++    assert_eq!(
++        submitted_positions(&user_message_texts(&session).await).len(),
++        1
++    );
++}
++
++#[tokio::test]
++async fn input_already_recorded_by_the_turn_is_not_recorded_again() {
++    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
++    stash_unrecorded_turn_input(&turn_context.extension_data, &submitted_input());
++    // The turn's own recording path takes ownership before it writes the input.
++    assert!(take_unrecorded_turn_input(&turn_context.extension_data).is_some());
++
++    let recorded =
++        crate::session::turn::record_unrecorded_turn_input(&session, &turn_context).await;
++
++    assert!(!recorded);
++    assert_eq!(
++        submitted_positions(&user_message_texts(&session).await),
++        Vec::<usize>::new()
++    );
++}
++
++/// A panic inside the turn task used to skip the finish path, leaving the turn active
++/// with no terminal event, so clients showed it as thinking forever.
++#[tokio::test]
++async fn panicking_turn_task_reports_error_completes_and_keeps_input() {
++    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
++    session
++        .spawn_task(
++            Arc::clone(&turn_context),
++            submitted_input(),
++            PanickingPreparationTask,
++        )
++        .await;
++
++    let error_message = tokio::time::timeout(Duration::from_secs(5), async {
++        let mut error_message = None;
++        loop {
++            let event = rx.recv().await.expect("session events should stay open");
++            match event.msg {
++                EventMsg::Error(error) => error_message = Some(error.message),
++                EventMsg::TurnComplete(_) => return error_message,
++                _ => {}
++            }
++        }
++    })
++    .await
++    .expect("a panicked turn must still complete");
++
++    assert!(
++        error_message
++            .as_deref()
++            .is_some_and(|message| message.contains("turn task panicked")),
++        "the panic must surface as the turn's error: {error_message:?}"
++    );
++    assert_eq!(
++        submitted_positions(&user_message_texts(&session).await).len(),
++        1
++    );
++}
+diff --git a/codex-rs/core/tests/world_state_timeout.rs b/codex-rs/core/tests/world_state_timeout.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..88f6f11dd51bcacc08cd08a868d32d3f4bad24fe
+--- /dev/null
++++ b/codex-rs/core/tests/world_state_timeout.rs
+@@ -0,0 +1,163 @@
++use std::sync::Arc;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++
++use anyhow::Result;
++use codex_core::TurnInputRequest;
++use codex_core::config::Config;
++use codex_extension_api::ContextContributor;
++use codex_extension_api::ExtensionFuture;
++use codex_extension_api::ExtensionRegistryBuilder;
++use codex_extension_api::WorldStateContributionInput;
++use codex_extension_api::WorldStateSectionContribution;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::mount_sse_sequence;
++use core_test_support::responses::sse;
++use core_test_support::responses::start_mock_server;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::run_test_with_large_stack;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event_with_timeout;
++
++struct StallWorldState {
++    calls: AtomicUsize,
++    stall_call: usize,
++}
++
++impl ContextContributor for StallWorldState {
++    fn contribute_world_state<'a>(
++        &'a self,
++        _input: WorldStateContributionInput<'a>,
++    ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
++        Box::pin(async move {
++            if self.calls.fetch_add(1, Ordering::SeqCst) == self.stall_call {
++                std::future::pending::<()>().await;
++            }
++            Vec::new()
++        })
++    }
++}
++
++#[test]
++fn stalled_second_world_state_build_uses_initial_context_and_reaches_model() -> Result<()> {
++    run_test_with_large_stack("world_state_timeout", test_stalled_second_world_state_build)
++}
++
++async fn test_stalled_second_world_state_build() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let mock = mount_sse_sequence(
++        &server,
++        vec![sse(vec![
++            ev_assistant_message("answer", "The request completed."),
++            ev_completed("response"),
++        ])],
++    )
++    .await;
++    let stalled_context = Arc::new(StallWorldState {
++        calls: AtomicUsize::new(0),
++        stall_call: 1,
++    });
++    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
++    extensions.prompt_contributor(stalled_context.clone());
++    let test = test_codex()
++        .with_extensions(Arc::new(extensions.build()))
++        .build_with_auto_env(&server)
++        .await?;
++
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "Answer this request.".to_string(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    let mut warned = false;
++    let mut answered = false;
++    wait_for_event_with_timeout(
++        &test.codex,
++        |event| {
++            assert!(!matches!(event, EventMsg::Error(_)), "{event:?}");
++            if let EventMsg::Warning(warning) = event {
++                warned |= warning.message.contains("Turn context refresh timed out");
++            }
++            if let EventMsg::AgentMessage(message) = event {
++                answered |= message.message == "The request completed.";
++            }
++            matches!(event, EventMsg::TurnComplete(_))
++        },
++        Duration::from_secs(45),
++    )
++    .await;
++
++    assert!(warned, "the fallback should be visible to the user");
++    assert!(answered, "the model response should be delivered");
++    assert_eq!(stalled_context.calls.load(Ordering::SeqCst), 2);
++    assert_eq!(mock.requests().len(), 1);
++    Ok(())
++}
++
++#[test]
++fn stalled_initial_world_state_build_reports_timeout_and_completes_turn() -> Result<()> {
++    run_test_with_large_stack(
++        "initial_world_state_timeout",
++        test_stalled_initial_world_state_build,
++    )
++}
++
++async fn test_stalled_initial_world_state_build() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let stalled_context = Arc::new(StallWorldState {
++        calls: AtomicUsize::new(0),
++        stall_call: 0,
++    });
++    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
++    extensions.prompt_contributor(stalled_context.clone());
++    let test = test_codex()
++        .with_extensions(Arc::new(extensions.build()))
++        .build_with_auto_env(&server)
++        .await?;
++
++    test.codex
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "Answer this request.".to_string(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    let mut timed_out = false;
++    wait_for_event_with_timeout(
++        &test.codex,
++        |event| {
++            if matches!(event, EventMsg::Error(_)) {
++                timed_out = true;
++            }
++            matches!(event, EventMsg::TurnComplete(_))
++        },
++        Duration::from_secs(45),
++    )
++    .await;
++
++    assert!(
++        timed_out,
++        "the stalled initial context should report an error"
++    );
++    assert_eq!(stalled_context.calls.load(Ordering::SeqCst), 1);
++    assert!(server.received_requests().await.unwrap().is_empty());
++    let history = test.codex.conversation_history_snapshot().await;
++    let history = serde_json::to_value(history.items().collect::<Vec<_>>())?;
++    assert!(
++        history
++            .as_array()
++            .is_some_and(|items| items.iter().any(|item| {
++                item["role"] == "user" && item["content"][0]["text"] == "Answer this request."
++            })),
++        "the timed-out turn should retain its user input"
++    );
++    Ok(())
++}

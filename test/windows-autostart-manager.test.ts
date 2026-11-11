@@ -1,0 +1,873 @@
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  type HiddenCommandRunner,
+  WindowsAutostartManager,
+} from "../src/infrastructure/windows/windows-autostart-manager.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
+  );
+});
+
+describe("WindowsAutostartManager", () => {
+  it("keeps hidden command output complete and has no implicit execution deadline", async () => {
+    const source = await readFile(
+      join(process.cwd(), "src", "infrastructure", "windows", "windows-autostart-manager.ts"),
+      "utf8",
+    );
+    expect(source).not.toContain("HIDDEN_COMMAND_TIMEOUT_MS");
+    expect(source).not.toContain("65_536 - stdout.length");
+    expect(source).not.toContain("65_536 - stderr.length");
+    expect(source).toContain("stdout += chunk.toString()");
+    expect(source).toContain("stderr += chunk.toString()");
+  });
+
+  it("creates a hidden WScript launcher with logon start and five-minute self-healing", async () => {
+    const fixture = await makeFixture();
+    const calls: Array<{ executable: string; args: readonly string[]; input?: string }> = [];
+    const runner: HiddenCommandRunner = {
+      run: async (executable, args, input) => {
+        calls.push({ executable, args, ...(input === undefined ? {} : { input }) });
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "query" || taskOperation(args, input) === "create") {
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+
+    await expect(manager.enable()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+    });
+    const launcher = await readFile(manager.launcherPath, "utf8");
+    expect(launcher).toContain('Set shell = CreateObject("WScript.Shell")');
+    expect(launcher).toContain('("OMNICODEX_AUTOSTART_SOURCE") = launchSource');
+    expect(launcher).toContain("exitCode = shell.Run(");
+    expect(launcher).toContain(", 0, True)");
+    expect(launcher).toContain("WScript.Quit exitCode");
+    expect(launcher).toContain('""start""');
+    expect(launcher).toContain('""--non-interactive""');
+    const create = calls.find((call) => taskOperation(call.args, call.input) === "create");
+    expect(create?.executable).toContain("powershell.exe");
+    expect(create?.args).toEqual(
+      expect.arrayContaining(["-NoProfile", "-NonInteractive", "-EncodedCommand"]),
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$definition.Principal.LogonType = 3",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$definition.Principal.RunLevel = 0",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$definition.Settings.Hidden = $true",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$watchdog = $definition.Triggers.Create(1)",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$watchdog.Repetition.Interval = 'PT5M'",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$definition.Settings.ExecutionTimeLimit = 'PT0S'",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$definition.Settings.RestartInterval = 'PT1M'",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "$definition.Settings.RestartCount = 3",
+    );
+    expect(taskScript(create?.args ?? [], create?.input)).toContain(
+      "Scheduled Task principal is not the current user",
+    );
+  });
+
+  it("refreshes owned launcher bytes without changing the Scheduled Task", async () => {
+    const fixture = await makeFixture();
+    const calls: Array<{ executable: string; args: readonly string[]; input?: string }> = [];
+    const runner: HiddenCommandRunner = {
+      run: async (executable, args, input) => {
+        calls.push({ executable, args, ...(input === undefined ? {} : { input }) });
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "query") {
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        return { code: 1, stdout: "unexpected mutation", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await mkdir(fixture.dataDirectory, { recursive: true });
+    await writeFile(manager.launcherPath, "launcher generated by another Node executable", "utf8");
+
+    await expect(manager.refreshOwnedLauncher()).resolves.toBe(true);
+    await expect(manager.status()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+      launcherVerified: true,
+    });
+    await expect(readFile(manager.launcherPath, "utf8")).resolves.toContain(fixture.nodeExecutable);
+    expect(
+      calls
+        .filter((call) => !registryOperation(call.args, call.input))
+        .every((call) => taskOperation(call.args, call.input) === "query"),
+    ).toBe(true);
+  });
+
+  it("leaves an already-current owned launcher untouched", async () => {
+    const fixture = await makeFixture();
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "query") {
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        return { code: 1, stdout: "unexpected mutation", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    const before = await stat(manager.launcherPath);
+
+    await expect(manager.refreshOwnedLauncher()).resolves.toBe(true);
+
+    const after = await stat(manager.launcherPath);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it("upgrades an owned task that predates immediate failure restart settings", async () => {
+    const fixture = await makeFixture();
+    const exactXml = scheduledTaskXml(fixture);
+    let currentXml = exactXml.replace(
+      "<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>",
+      "",
+    );
+    let created = false;
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        const operation = taskOperation(args, input);
+        if (operation === "create") {
+          created = true;
+          currentXml = exactXml;
+          return { code: 0, stdout: exactXml, stderr: "" };
+        }
+        if (operation === "query") {
+          return { code: 0, stdout: currentXml, stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.enable()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+      actionVerified: true,
+    });
+    expect(created).toBe(true);
+  });
+
+  it("queries and removes only the fixed OmniCodex task", async () => {
+    const fixture = await makeFixture();
+    const calls: readonly string[][] = [];
+    const mutableCalls = calls as string[][];
+    let taskExists = true;
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        mutableCalls.push([...args]);
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "delete") {
+          taskExists = false;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return {
+          code: taskOperation(args, input) === "query" && taskExists ? 0 : 1,
+          stdout:
+            taskOperation(args, input) === "query" && taskExists ? scheduledTaskXml(fixture) : "",
+          stderr: "",
+        };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    await expect(manager.status()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+    });
+    await expect(manager.disable()).resolves.toMatchObject({ enabled: false });
+    expect(taskExists).toBe(false);
+    expect(mutableCalls.some((args) => args[0] === "delete")).toBe(false);
+  });
+
+  it("reports an owned disabled task without claiming autostart is enabled", async () => {
+    const fixture = await makeFixture();
+    const xml = scheduledTaskXml(fixture).replace(
+      "<Enabled>true</Enabled><Hidden>true</Hidden>",
+      "<Enabled>false</Enabled><Hidden>true</Hidden>",
+    );
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "query") {
+          return { code: 0, stdout: xml, stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.status()).resolves.toMatchObject({
+      enabled: false,
+      mechanism: "scheduled-task",
+      actionVerified: true,
+      launcherVerified: true,
+    });
+    await expect(manager.launch()).rejects.toThrow(
+      "independent launch requires the owned Scheduled Task",
+    );
+  });
+
+  it("honors the Task Scheduler schema default when enabled elements are omitted", async () => {
+    const fixture = await makeFixture();
+    const xml = scheduledTaskXml(fixture).replaceAll("<Enabled>true</Enabled>", "");
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        return taskOperation(args, input) === "query"
+          ? { code: 0, stdout: xml, stderr: "" }
+          : { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.status()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+      actionVerified: true,
+      launcherVerified: true,
+    });
+  });
+
+  it("treats a disabled watchdog trigger as inactive autostart", async () => {
+    const fixture = await makeFixture();
+    const xml = scheduledTaskXml(fixture).replace(
+      "<TimeTrigger><Enabled>true</Enabled>",
+      "<TimeTrigger><Enabled>false</Enabled>",
+    );
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        return taskOperation(args, input) === "query"
+          ? { code: 0, stdout: xml, stderr: "" }
+          : { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.status()).resolves.toMatchObject({
+      enabled: false,
+      mechanism: "scheduled-task",
+    });
+  });
+
+  it("treats a disabled logon trigger as inactive and can remove the owned task", async () => {
+    const fixture = await makeFixture();
+    const xml = scheduledTaskXml(fixture).replace(
+      "<LogonTrigger><Enabled>true</Enabled>",
+      "<LogonTrigger><Enabled>false</Enabled>",
+    );
+    let taskExists = true;
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "delete") {
+          taskExists = false;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return taskOperation(args, input) === "query" && taskExists
+          ? { code: 0, stdout: xml, stderr: "" }
+          : { code: 1, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.disable()).resolves.toMatchObject({
+      enabled: false,
+      mechanism: null,
+    });
+    expect(taskExists).toBe(false);
+  });
+
+  it("fails closed instead of falling back when Task Scheduler denies access", async () => {
+    const fixture = await makeFixture();
+    const calls: Array<{ executable: string; args: readonly string[]; input?: string }> = [];
+    const runner: HiddenCommandRunner = {
+      run: async (executable, args, input) => {
+        calls.push({ executable, args, ...(input === undefined ? {} : { input }) });
+        if (taskOperation(args, input) === "create") {
+          return { code: 1, stdout: "ERROR: Access is denied.", stderr: "" };
+        }
+        if (taskOperation(args, input) === "query") {
+          return { code: 1, stdout: "", stderr: "" };
+        }
+        if (registryOperation(args, input)) {
+          return { code: 0, stdout: runValueOutput(fixture), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+
+    await expect(manager.enable()).rejects.toThrow("HKCU Run fallback is forbidden");
+    expect(calls.some((call) => call.args[0] === "add")).toBe(false);
+  });
+
+  it("does not reinterpret a legacy Run query failure as an absent registration", async () => {
+    const fixture = await makeFixture();
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) =>
+        registryOperation(args, input)
+          ? { code: 2, stdout: "", stderr: "registry access denied" }
+          : { code: 1, stdout: "", stderr: "" },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+
+    await expect(manager.status()).rejects.toThrow("registry access denied");
+  });
+
+  it("propagates Task Scheduler spawn denial without creating a Run value", async () => {
+    const fixture = await makeFixture();
+    const calls: Array<{ executable: string; args: readonly string[]; input?: string }> = [];
+    const runner: HiddenCommandRunner = {
+      run: async (executable, args, input) => {
+        calls.push({ executable, args, ...(input === undefined ? {} : { input }) });
+        if (taskOperation(args, input) === "create") {
+          const error = new Error("spawn denied") as Error & { code: string };
+          error.code = "EPERM";
+          throw error;
+        }
+        if (taskOperation(args, input) === "query") {
+          return { code: 1, stdout: "", stderr: "" };
+        }
+        if (registryOperation(args, input)) {
+          return { code: 0, stdout: runValueOutput(fixture), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await expect(manager.enable()).rejects.toMatchObject({ code: "EPERM" });
+    expect(calls.some((call) => call.args[0] === "add")).toBe(false);
+  });
+
+  it("rolls back a newly created task and restores the prior launcher on failed readback", async () => {
+    const fixture = await makeFixture();
+    let taskExists = false;
+    let failReadback = false;
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "create") {
+          taskExists = true;
+          failReadback = true;
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        if (taskOperation(args, input) === "delete") {
+          taskExists = false;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (taskOperation(args, input) === "query") {
+          if (failReadback) return { code: 2, stdout: "", stderr: "readback failed" };
+          return taskExists
+            ? { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" }
+            : { code: 1, stdout: "", stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await mkdir(fixture.dataDirectory, { recursive: true });
+    await writeFile(manager.launcherPath, "previous launcher", "utf8");
+
+    await expect(manager.enable()).rejects.toThrow("readback failed");
+    await expect(readFile(manager.launcherPath, "utf8")).resolves.toBe("previous launcher");
+    expect(taskExists).toBe(false);
+  });
+
+  it("restores an existing owned task definition when replacement readback fails", async () => {
+    const fixture = await makeFixture();
+    const previousXml = scheduledTaskXml(fixture);
+    const replacementXml = previousXml.replace("2026-08-21T01:00:00", "2026-08-21T01:05:00");
+    let currentXml = previousXml;
+    let failNextQuery = false;
+    let restoredInput: string | undefined;
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        const operation = taskOperation(args, input);
+        if (operation === "create") {
+          currentXml = replacementXml;
+          failNextQuery = true;
+          return { code: 0, stdout: replacementXml, stderr: "" };
+        }
+        if (operation === "restore") {
+          restoredInput = input;
+          currentXml = input ?? "";
+          return { code: 0, stdout: currentXml, stderr: "" };
+        }
+        if (operation === "query") {
+          if (failNextQuery) {
+            failNextQuery = false;
+            return { code: 2, stdout: "", stderr: "readback failed" };
+          }
+          return { code: 0, stdout: currentXml, stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await mkdir(fixture.dataDirectory, { recursive: true });
+    await writeFile(manager.launcherPath, "previous launcher", "utf8");
+
+    await expect(manager.enable()).rejects.toThrow("readback failed");
+    expect(restoredInput).toBe(previousXml);
+    expect(currentXml).toBe(previousXml);
+    await expect(readFile(manager.launcherPath, "utf8")).resolves.toBe("previous launcher");
+  });
+
+  it("reports a per-user Run registration when the task is absent", async () => {
+    const fixture = await makeFixture();
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) =>
+        registryOperation(args, input)
+          ? { code: 0, stdout: runValueOutput(fixture), stderr: "" }
+          : { code: 1, stdout: "", stderr: "" },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    await expect(manager.status()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "legacy-hkcu-run",
+      legacyRunRegistration: true,
+    });
+  });
+
+  it("refuses an exact registration whose hidden launcher bytes were changed", async () => {
+    const fixture = await makeFixture();
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) =>
+        registryOperation(args, input)
+          ? { code: 0, stdout: runValueOutput(fixture), stderr: "" }
+          : { code: 1, stdout: "", stderr: "" },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await mkdir(join(fixture.dataDirectory), { recursive: true });
+    await writeFile(manager.launcherPath, "foreign launcher", "utf8");
+    await expect(manager.status()).rejects.toThrow("launcher bytes");
+  });
+
+  it("refuses a same-action task that is not hidden and least-privilege interactive logon", async () => {
+    const fixture = await makeFixture();
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "query") {
+          return {
+            code: 0,
+            stdout: scheduledTaskXml(fixture).replace(
+              "<Hidden>true</Hidden>",
+              "<Hidden>false</Hidden>",
+            ),
+            stderr: "",
+          };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    await expect(manager.status()).rejects.toThrow("action is not the owned hidden launcher");
+  });
+
+  it("returns the latest bounded successful launcher receipt", async () => {
+    const fixture = await makeFixture();
+    const bootedAtUnixMs = Date.parse("2026-08-21T01:00:00.000Z");
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) =>
+        registryOperation(args, input)
+          ? { code: 0, stdout: runValueOutput(fixture), stderr: "" }
+          : { code: 1, stdout: "", stderr: "" },
+    };
+    const manager = new WindowsAutostartManager({
+      ...fixture,
+      runner,
+      nowUnixMs: () => bootedAtUnixMs + 10 * 60_000,
+      uptimeSeconds: () => 10 * 60,
+    });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    const logs = join(fixture.dataDirectory, "logs");
+    await mkdir(logs, { recursive: true });
+    await writeFile(
+      join(logs, "autostart-launcher.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-08-21T01:00:01.000Z",
+        startedAt: "2026-08-21T01:00:00.000Z",
+        event: "autostart_succeeded",
+        source: "scheduled-task",
+        bootedAtUnixMs,
+        attempts: 1,
+        exitCode: 0,
+        signal: null,
+        spawnErrorCode: null,
+        pointerVersion: "1.2.3",
+        pointerActivatedAtUnixMs: 123,
+      })}\n`,
+      "utf8",
+    );
+    await expect(manager.status()).resolves.toMatchObject({
+      actionVerified: true,
+      launcherVerified: true,
+      rebootVerifiedForCurrentBoot: true,
+      lastLaunch: {
+        event: "autostart_succeeded",
+        attempts: 1,
+        exitCode: 0,
+        pointerVersion: "1.2.3",
+      },
+    });
+    await writeFile(
+      join(logs, "autostart-launcher.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-08-21T01:00:01.500Z",
+        startedAt: "2026-08-21T01:00:00.500Z",
+        event: "autostart_failed",
+        source: "scheduled-task",
+        bootedAtUnixMs,
+        attempts: 1,
+        exitCode: 1,
+        pointerVersion: "1.2.3",
+        pointerActivatedAtUnixMs: 123,
+      })}\n`,
+      "utf8",
+    );
+    await expect(manager.status()).resolves.toMatchObject({
+      rebootVerifiedForCurrentBoot: false,
+    });
+    await writeFile(
+      join(logs, "autostart-launcher.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-08-21T01:00:02.000Z",
+        startedAt: "2026-08-21T01:00:01.000Z",
+        event: "autostart_succeeded",
+        source: "scheduled-task",
+        bootedAtUnixMs,
+        attempts: 1,
+        exitCode: 0,
+        pointerVersion: "1.2.3",
+        pointerActivatedAtUnixMs: bootedAtUnixMs + 60_000,
+      })}\n`,
+      "utf8",
+    );
+    await expect(manager.status()).resolves.toMatchObject({
+      rebootVerifiedForCurrentBoot: false,
+    });
+
+    const latest = {
+      timestamp: "2026-08-21T01:00:03.000Z",
+      startedAt: "2026-08-21T01:00:02.000Z",
+      event: "autostart_succeeded",
+      source: "scheduled-task",
+      bootedAtUnixMs,
+      attempts: 1,
+      exitCode: 0,
+      pointerVersion: "1.2.3",
+      pointerActivatedAtUnixMs: 123,
+    };
+    await writeFile(
+      join(logs, "autostart-launcher.jsonl"),
+      `${"x".repeat(1024 * 1024 + 1)}\n${JSON.stringify(latest)}\n`,
+      "utf8",
+    );
+    await expect(manager.status()).resolves.toMatchObject({
+      lastLaunch: { timestamp: latest.timestamp, event: "autostart_succeeded" },
+    });
+  });
+
+  it("executes the exact hidden WScript path and requires a fresh success receipt", async () => {
+    const fixture = await makeFixture();
+    let now = Date.parse("2026-08-21T01:00:00.000Z");
+    const logs = join(fixture.dataDirectory, "logs");
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (args[0] === "//B") {
+          await mkdir(logs, { recursive: true });
+          await writeFile(
+            join(logs, "autostart-launcher.jsonl"),
+            `${JSON.stringify({
+              timestamp: new Date(now + 2).toISOString(),
+              startedAt: new Date(now + 1).toISOString(),
+              event: "autostart_succeeded",
+              source: "manual-test",
+              bootedAtUnixMs: now - 60_000,
+              attempts: 1,
+              exitCode: 0,
+              pointerVersion: "1.2.3",
+              pointerActivatedAtUnixMs: 123,
+            })}\n`,
+            "utf8",
+          );
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (registryOperation(args, input)) return absentRunResult();
+        if (taskOperation(args, input) === "query") {
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({
+      ...fixture,
+      runner,
+      nowUnixMs: () => now,
+      uptimeSeconds: () => 60,
+      delay: async (milliseconds) => {
+        now += milliseconds;
+      },
+    });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    await expect(manager.test()).resolves.toMatchObject({
+      enabled: true,
+      rebootVerifiedForCurrentBoot: false,
+      lastLaunch: { event: "autostart_succeeded", exitCode: 0 },
+    });
+  });
+
+  it("launches the owned action through Task Scheduler instead of as a caller child", async () => {
+    const fixture = await makeFixture();
+    const scripts: string[] = [];
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        const script = taskScript(args, input);
+        scripts.push(script);
+        if (taskOperation(args, input) === "query") {
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.launch()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+    });
+    expect(scripts.some((script) => script.includes("$task.Run($null)"))).toBe(true);
+  });
+
+  it("reports the owned Scheduled Task instance count without launching another instance", async () => {
+    const fixture = await makeFixture();
+    const scripts: string[] = [];
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        if (registryOperation(args, input)) return absentRunResult();
+        const script = taskScript(args, input);
+        scripts.push(script);
+        if (taskOperation(args, input) === "instances") {
+          return { code: 0, stdout: "1", stderr: "" };
+        }
+        if (taskOperation(args, input) === "query") {
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "unexpected operation" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+
+    await expect(manager.runningInstanceCount()).resolves.toBe(1);
+    expect(scripts.some((script) => script.includes("$task.GetInstances(0).Count"))).toBe(true);
+    expect(scripts.some((script) => script.includes("$task.Run($null)"))).toBe(false);
+  });
+
+  it("refuses to delete a same-name Run value with a foreign action", async () => {
+    const fixture = await makeFixture();
+    const calls: readonly string[][] = [];
+    const mutableCalls = calls as string[][];
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        mutableCalls.push([...args]);
+        if (registryOperation(args, input)) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ status: "present", value: '"C:\\foreign.exe"' }),
+            stderr: "",
+          };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+
+    await expect(manager.disable()).rejects.toThrow("not the owned hidden launcher");
+    expect(mutableCalls).toHaveLength(1);
+    expect(registryOperation(mutableCalls[0] ?? [], undefined)).toBe(true);
+  });
+
+  it("migrates the exact owned legacy Run value to only the Scheduled Task", async () => {
+    const fixture = await makeFixture();
+    let taskExists = false;
+    let legacyExists = true;
+    const calls: string[] = [];
+    const runner: HiddenCommandRunner = {
+      run: async (_executable, args, input) => {
+        calls.push(args[0] ?? "");
+        if (registryOperation(args, input)) {
+          return legacyExists
+            ? { code: 0, stdout: runValueOutput(fixture), stderr: "" }
+            : absentRunResult();
+        }
+        if (args[0] === "delete") {
+          legacyExists = false;
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (taskOperation(args, input) === "create") {
+          taskExists = true;
+          return { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" };
+        }
+        if (taskOperation(args, input) === "query") {
+          return taskExists
+            ? { code: 0, stdout: scheduledTaskXml(fixture), stderr: "" }
+            : { code: 1, stdout: "", stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      },
+    };
+    const manager = new WindowsAutostartManager({ ...fixture, runner });
+    await seedExpectedLauncher(manager.launcherPath, fixture);
+    await expect(manager.enable()).resolves.toMatchObject({
+      enabled: true,
+      mechanism: "scheduled-task",
+      legacyRunRegistration: false,
+    });
+    expect(calls).toContain("delete");
+    expect(taskExists).toBe(true);
+    expect(legacyExists).toBe(false);
+  });
+});
+
+async function makeFixture() {
+  const root = await mkdtemp(join(tmpdir(), "omnicodex-autostart-"));
+  temporaryDirectories.push(root);
+  const windowsDirectory = join(root, "Windows");
+  const system32 = join(windowsDirectory, "System32");
+  const powershellDirectory = join(system32, "WindowsPowerShell", "v1.0");
+  const nodeExecutable = join(root, "node.exe");
+  const launcherScript = join(root, "omnicodex-launcher.mjs");
+  await mkdir(powershellDirectory, { recursive: true });
+  await Promise.all(
+    [
+      nodeExecutable,
+      launcherScript,
+      join(powershellDirectory, "powershell.exe"),
+      join(system32, "wscript.exe"),
+      join(system32, "reg.exe"),
+    ].map((path) => writeFile(path, "", "utf8")),
+  );
+  return {
+    nodeExecutable,
+    launcherScript,
+    dataDirectory: join(root, "data"),
+    windowsDirectory,
+  };
+}
+
+function taskOperation(
+  args: readonly string[],
+  input: string | undefined,
+): "query" | "instances" | "create" | "delete" | "run" | "restore" | undefined {
+  const script = taskScript(args, input);
+  if (script.includes("RegisterTaskDefinition")) return "create";
+  if (script.includes("$folder.RegisterTask($taskName, $xml")) return "restore";
+  if (script.includes("DeleteTask")) return "delete";
+  if (script.includes("$task.GetInstances(0).Count")) return "instances";
+  if (script.includes("$task.Run($null)")) return "run";
+  if (script.includes("[Console]::Out.Write($task.Xml)")) return "query";
+  return undefined;
+}
+
+function registryOperation(args: readonly string[], input: string | undefined): boolean {
+  return taskScript(args, input).includes("[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey");
+}
+
+function taskScript(args: readonly string[], input: string | undefined): string {
+  const index = args.indexOf("-EncodedCommand");
+  const encoded = index < 0 ? undefined : args[index + 1];
+  if (encoded !== undefined) return Buffer.from(encoded, "base64").toString("utf16le");
+  return input ?? "";
+}
+
+function scheduledTaskXml(fixture: Awaited<ReturnType<typeof makeFixture>>): string {
+  const executable = join(fixture.windowsDirectory, "System32", "wscript.exe");
+  const launcher = join(fixture.dataDirectory, "autostart.vbs");
+  return `<Task><RegistrationInfo><Author>OmniCodex</Author><URI>\\OmniCodex\\Gateway</URI></RegistrationInfo><Principals><Principal><UserId>S-1-5-21-1-1000</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><Enabled>true</Enabled><Hidden>true</Hidden><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>OWNER\\User</UserId></LogonTrigger><TimeTrigger><Enabled>true</Enabled><StartBoundary>2026-08-21T01:00:00</StartBoundary><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger></Triggers><Actions><Exec><Command>${executable}</Command><Arguments>"//B" "//Nologo" "${launcher}" "scheduled-task"</Arguments></Exec></Actions></Task>`;
+}
+
+function runValueOutput(fixture: Awaited<ReturnType<typeof makeFixture>>): string {
+  const executable = join(fixture.windowsDirectory, "System32", "wscript.exe");
+  const launcher = join(fixture.dataDirectory, "autostart.vbs");
+  return JSON.stringify({
+    status: "present",
+    value: `"${executable}" "//B" "//Nologo" "${launcher}"`,
+  });
+}
+
+function absentRunResult(): { readonly code: 0; readonly stdout: string; readonly stderr: string } {
+  return { code: 0, stdout: '{"status":"absent"}', stderr: "" };
+}
+
+async function seedExpectedLauncher(
+  path: string,
+  fixture: Awaited<ReturnType<typeof makeFixture>>,
+): Promise<void> {
+  await mkdir(fixture.dataDirectory, { recursive: true });
+  const command = [
+    fixture.nodeExecutable,
+    fixture.launcherScript,
+    "start",
+    "--non-interactive",
+    "--json",
+  ]
+    .map((value) => `"${value}"`)
+    .join(" ");
+  const script = [
+    "Option Explicit",
+    "If WScript.Arguments.Count <> 1 Then WScript.Quit 2",
+    "Dim launchSource",
+    "launchSource = LCase(WScript.Arguments(0))",
+    'If launchSource <> "scheduled-task" And launchSource <> "manual-test" Then WScript.Quit 2',
+    "Dim shell",
+    "Dim exitCode",
+    'Set shell = CreateObject("WScript.Shell")',
+    'shell.Environment("PROCESS")("OMNICODEX_AUTOSTART_SOURCE") = launchSource',
+    `exitCode = shell.Run("${command.replaceAll('"', '""')}", 0, True)`,
+    "WScript.Quit exitCode",
+    "",
+  ].join("\r\n");
+  await writeFile(path, script, "utf8");
+}

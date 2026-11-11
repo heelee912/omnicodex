@@ -1,0 +1,245 @@
+diff --git a/codex-rs/codex-mcp/src/binding.rs b/codex-rs/codex-mcp/src/binding.rs
+index a5c17924dc..8b35cb3a5f 100644
+--- a/codex-rs/codex-mcp/src/binding.rs
++++ b/codex-rs/codex-mcp/src/binding.rs
+@@ -379,6 +379,24 @@ impl PreparedMcpCall {
+             .await
+     }
+ 
++    /// Resolve a local response under the same bound tool catalog used for a server call.
++    /// The callback runs only while the prepared tool is still in that catalog.
++    pub async fn call_local_with_preparation<F, Fut>(&self, prepare: F) -> Result<CallToolResult>
++    where
++        F: FnOnce() -> Fut,
++        Fut: Future<Output = Result<CallToolResult>>,
++    {
++        let tool_name = self.tool_info().tool.name.to_string();
++        self.client
++            .tool_catalog
++            .run_with_snapshot(&self.catalog_snapshot, prepare)
++            .await
++            .ok_or_else(|| anyhow::anyhow!(
++                "tool call rejected because the catalog changed after `{}/{tool_name}` was prepared",
++                self.server_name
++            ))?
++    }
++
+     /// Runs irreversible call preparation and execution under the authority of
+     /// this call's captured catalog and the extensions owned by the Codex session.
+     /// A caller-supplied timeout can further restrict the server's configured timeout.
+diff --git a/codex-rs/codex-mcp/src/binding_tests.rs b/codex-rs/codex-mcp/src/binding_tests.rs
+index d816befd1b..1df20b0d36 100644
+--- a/codex-rs/codex-mcp/src/binding_tests.rs
++++ b/codex-rs/codex-mcp/src/binding_tests.rs
+@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
+ use codex_config::AppToolApproval;
+ use codex_config::Constrained;
+ use codex_config::types::ApprovalsReviewer;
++use codex_protocol::mcp::CallToolResult;
+ use codex_protocol::mcp::McpServerInfo;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::protocol::AskForApproval;
+@@ -335,6 +336,74 @@ async fn prepared_call_is_rejected_after_catalog_refresh() {
+     );
+ }
+ 
++#[tokio::test]
++async fn local_call_returns_bound_result_without_contacting_server() {
++    let step = test_step(
++        "old",
++        AppToolApproval::Prompt,
++        /*supports_sandbox_state_meta*/ false,
++    )
++    .await;
++    let prepared = step
++        .step
++        .prepare_call(SERVER_NAME, TOOL_NAME)
++        .expect("step should prepare the advertised tool");
++
++    let result = prepared
++        .call_local_with_preparation(|| async { Ok(local_document_result()) })
++        .await
++        .expect("local result should not require the test server to answer");
++
++    assert_eq!(
++        result.content,
++        vec![serde_json::json!({"type": "text", "text": "# 보호 문서\n\n정상입니다."})]
++    );
++    assert_eq!(result.is_error, None);
++}
++
++#[tokio::test]
++async fn stale_local_call_does_not_apply_preparation() {
++    let step = test_step(
++        "old",
++        AppToolApproval::Prompt,
++        /*supports_sandbox_state_meta*/ false,
++    )
++    .await;
++    let prepared = step
++        .step
++        .prepare_call(SERVER_NAME, TOOL_NAME)
++        .expect("step should prepare the advertised tool");
++    step.tool_catalog
++        .refresh(
++            || async { Ok((step.step.tools().to_vec(), None, ())) },
++            |_, _, ()| {},
++        )
++        .await
++        .expect("refresh tool catalog");
++    let preparation_ran = Arc::new(AtomicBool::new(false));
++    let marker = Arc::clone(&preparation_ran);
++
++    let error = prepared
++        .call_local_with_preparation(|| async move {
++            marker.store(true, Ordering::SeqCst);
++            Ok(local_document_result())
++        })
++        .await
++        .expect_err("stale local call must be rejected");
++
++    assert!(format!("{error:#}").contains("catalog changed"));
++    assert!(!preparation_ran.load(Ordering::SeqCst));
++}
++
++fn local_document_result() -> CallToolResult {
++    CallToolResult {
++        content: vec![serde_json::json!({"type": "text", "text": "# 보호 문서\n\n정상입니다."})],
++        structured_content: None,
++        is_error: None,
++        meta: None,
++    }
++}
++
+ #[tokio::test]
+ async fn stale_prepared_call_does_not_run_preparation() {
+     let step = test_step(
+diff --git a/codex-rs/core/src/mcp_tool_call.rs b/codex-rs/core/src/mcp_tool_call.rs
+index 6bf51b9ab1..f1edfd0725 100644
+--- a/codex-rs/core/src/mcp_tool_call.rs
++++ b/codex-rs/core/src/mcp_tool_call.rs
+@@ -12,6 +12,8 @@ use crate::guardian::GuardianReviewContext;
+ use crate::mcp_openai_file::rewrite_mcp_tool_arguments_for_openai_files;
+ use crate::mcp_tool_approval_templates::RenderedMcpToolApprovalParam;
+ use crate::mcp_tool_approval_templates::render_mcp_tool_approval_template;
++use crate::protected_documentation::ProtectedDocument;
++use crate::protected_documentation::protected_document_text;
+ use crate::session::session::Session;
+ use crate::session::step_context::StepContext;
+ use crate::session::turn_context::TurnContext;
+@@ -480,6 +482,9 @@ async fn handle_approved_mcp_tool_call(
+     let connector_id = metadata.connector_id.as_deref();
+     let connector_name = metadata.connector_name.as_deref();
+     let server_origin = prepared_call.server_origin().map(str::to_string);
++    let protected_document = arguments_value
++        .as_ref()
++        .and_then(|arguments| ProtectedDocument::for_call(None, &tool_name, arguments));
+ 
+     let start = Instant::now();
+     let mut tool_input = arguments_value
+@@ -489,34 +494,47 @@ async fn handle_approved_mcp_tool_call(
+     let mut request_error_code = None;
+     let result = async {
+         let result = async {
+-            let mut result = prepared_call
+-                .call_with_preparation(/*requested_timeout*/ None, || async {
+-                    if let McpToolApprovalApplication::Apply { decision, policy } =
+-                        &approval_application
+-                    {
+-                        let session_approval_key = session_mcp_tool_approval_key(
+-                            &invocation,
+-                            Some(&metadata),
+-                            policy.mode,
+-                        );
+-                        let persistent_approval_key = if policy.allow_persistent {
+-                            persistent_mcp_tool_approval_key(
+-                                &invocation,
+-                                Some(&metadata),
+-                                policy.mode,
+-                            )
+-                        } else {
+-                            None
+-                        };
+-                        apply_mcp_tool_approval_decision(
++            if let Some(document) = protected_document {
++                let result = prepared_call
++                    .call_local_with_preparation(|| async {
++                        apply_mcp_tool_approval_application(
+                             sess,
+                             turn_context,
+-                            decision,
+-                            session_approval_key,
+-                            persistent_approval_key,
++                            &invocation,
++                            &metadata,
++                            &approval_application,
+                         )
+                         .await;
+-                    }
++                        let (markdown, success) =
++                            protected_document_text(&turn_context.config.codex_home, document)
++                                .await;
++                        Ok(CallToolResult {
++                            content: vec![serde_json::json!({"type": "text", "text": markdown})],
++                            structured_content: None,
++                            is_error: (!success).then_some(true),
++                            meta: None,
++                        })
++                    })
++                    .await
++                    .map_err(|error| {
++                        request_error_code = codex_rmcp_client::request_error_code(&error);
++                        format!("tool call error: {error:?}")
++                    })?;
++                return sanitize_mcp_tool_result_for_model(
++                    &step_context.settings.model_info.input_modalities,
++                    Ok(result),
++                );
++            }
++            let mut result = prepared_call
++                .call_with_preparation(/*requested_timeout*/ None, || async {
++                    apply_mcp_tool_approval_application(
++                        sess,
++                        turn_context,
++                        &invocation,
++                        &metadata,
++                        &approval_application,
++                    )
++                    .await;
+                     maybe_mark_thread_memory_mode_polluted(sess, turn_context, &prepared_call)
+                         .await;
+                     let hosted_upload = item_metadata
+@@ -680,6 +698,33 @@ async fn handle_approved_mcp_tool_call(
+     }
+ }
+ 
++async fn apply_mcp_tool_approval_application(
++    sess: &Arc<Session>,
++    turn_context: &TurnContext,
++    invocation: &McpInvocation,
++    metadata: &McpToolApprovalMetadata,
++    approval_application: &McpToolApprovalApplication,
++) {
++    let McpToolApprovalApplication::Apply { decision, policy } = approval_application else {
++        return;
++    };
++    let session_approval_key =
++        session_mcp_tool_approval_key(invocation, Some(metadata), policy.mode);
++    let persistent_approval_key = if policy.allow_persistent {
++        persistent_mcp_tool_approval_key(invocation, Some(metadata), policy.mode)
++    } else {
++        None
++    };
++    apply_mcp_tool_approval_decision(
++        sess,
++        turn_context,
++        decision,
++        session_approval_key,
++        persistent_approval_key,
++    )
++    .await;
++}
++
+ fn mcp_tool_call_span(
+     session: &Session,
+     turn_context: &TurnContext,

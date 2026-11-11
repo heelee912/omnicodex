@@ -1,0 +1,1008 @@
+diff --git a/codex-rs/app-server-transport/src/lib.rs b/codex-rs/app-server-transport/src/lib.rs
+index 895f65a0fd7106635cf3bcf1e51761405e202024..65fe175fd04dda073cc0ec226790eb2b5418747e 100644
+--- a/codex-rs/app-server-transport/src/lib.rs
++++ b/codex-rs/app-server-transport/src/lib.rs
+@@ -40,6 +40,8 @@ pub use transport::app_server_startup_lock_path;
+ pub use transport::bind_private_daemon_socket;
+ pub use transport::daemon_recovery_file_path;
+ pub use transport::start_control_socket_acceptor;
++#[cfg(windows)]
++pub use transport::start_named_pipe_acceptor;
+ pub use transport::start_remote_control;
+ pub use transport::start_stdio_connection;
+ pub use transport::start_websocket_acceptor;
+diff --git a/codex-rs/app-server-transport/src/transport/mod.rs b/codex-rs/app-server-transport/src/transport/mod.rs
+index cd7557810bd82a77af16e7e9ba5ad29122b07b3a..101bb9b79e18b295fd569677723d13d81a14e4bc 100644
+--- a/codex-rs/app-server-transport/src/transport/mod.rs
++++ b/codex-rs/app-server-transport/src/transport/mod.rs
+@@ -23,6 +23,8 @@ use tracing::warn;
+ /// plenty for an interactive CLI.
+ pub const CHANNEL_CAPACITY: usize = 128;
+ 
++#[cfg(windows)]
++mod named_pipe;
+ mod remote_control;
+ mod stdio;
+ mod unix_socket;
+@@ -30,6 +32,8 @@ mod unix_socket;
+ mod unix_socket_tests;
+ mod websocket;
+ 
++#[cfg(windows)]
++pub use named_pipe::start_named_pipe_acceptor;
+ pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
+ pub use remote_control::RemoteControlDisabledByRequirements;
+ pub use remote_control::RemoteControlEnableError;
+@@ -200,6 +204,7 @@ pub enum TransportEvent {
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum ConnectionOrigin {
+     Stdio,
++    NamedPipe,
+     InProcess,
+     WebSocket,
+     RemoteControl,
+diff --git a/codex-rs/app-server-transport/src/transport/named_pipe.rs b/codex-rs/app-server-transport/src/transport/named_pipe.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2dd001cad2e88a64b85b7aa255adbd05c0949c2b
+--- /dev/null
++++ b/codex-rs/app-server-transport/src/transport/named_pipe.rs
+@@ -0,0 +1,202 @@
++//! An additional local JSONL connection to a Desktop-owned stdio app-server.
++
++use super::CHANNEL_CAPACITY;
++use super::ConnectionOrigin;
++use super::TransportEvent;
++use super::forward_incoming_message;
++use super::next_connection_id;
++use super::serialize_outgoing_message;
++use crate::outgoing_message::QueuedOutgoingMessage;
++use std::io;
++use std::os::windows::io::AsRawHandle;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncWriteExt;
++use tokio::io::BufReader;
++use tokio::net::windows::named_pipe::NamedPipeServer;
++use tokio::net::windows::named_pipe::ServerOptions;
++use tokio::sync::mpsc;
++use tokio::task::JoinHandle;
++use tokio_util::sync::CancellationToken;
++use tracing::warn;
++
++pub async fn start_named_pipe_acceptor(
++    pipe_name: String,
++    transport_event_tx: mpsc::Sender<TransportEvent>,
++    shutdown: CancellationToken,
++) -> io::Result<JoinHandle<()>> {
++    let mut first_options = ServerOptions::new();
++    first_options
++        .first_pipe_instance(true)
++        .reject_remote_clients(true);
++    let first = first_options.create(&pipe_name)?;
++
++    Ok(tokio::spawn(async move {
++        let mut waiting = first;
++        loop {
++            let result = tokio::select! {
++                result = waiting.connect() => result,
++                _ = shutdown.cancelled() => break,
++            };
++            if let Err(error) = result {
++                warn!(%error, "named pipe accept failed");
++                break;
++            }
++            let connected = waiting;
++            let mut next_options = ServerOptions::new();
++            next_options.reject_remote_clients(true);
++            match next_options.create(&pipe_name) {
++                Ok(next) => waiting = next,
++                Err(error) => {
++                    warn!(%error, "named pipe listener replacement failed");
++                    break;
++                }
++            }
++            if let Err(error) =
++                codex_uds::ensure_current_user_named_pipe_peer(connected.as_raw_handle())
++            {
++                warn!(%error, "rejecting named pipe peer");
++                continue;
++            }
++            tokio::spawn(serve_connection(
++                connected,
++                transport_event_tx.clone(),
++                shutdown.clone(),
++            ));
++        }
++    }))
++}
++
++async fn serve_connection(
++    pipe: NamedPipeServer,
++    transport_event_tx: mpsc::Sender<TransportEvent>,
++    shutdown: CancellationToken,
++) {
++    let connection_id = next_connection_id();
++    let disconnect = CancellationToken::new();
++    let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
++    if transport_event_tx
++        .send(TransportEvent::ConnectionOpened {
++            connection_id,
++            origin: ConnectionOrigin::NamedPipe,
++            auth: None,
++            writer: writer_tx.clone(),
++            disconnect_sender: Some(disconnect.clone()),
++        })
++        .await
++        .is_err()
++    {
++        return;
++    }
++
++    let (reader, mut writer) = tokio::io::split(pipe);
++    let mut lines = BufReader::new(reader).lines();
++    let reader = async {
++        loop {
++            match lines.next_line().await {
++                Ok(Some(line)) => {
++                    if !forward_incoming_message(
++                        &transport_event_tx,
++                        &writer_tx,
++                        connection_id,
++                        &line,
++                    )
++                    .await
++                    {
++                        break;
++                    }
++                }
++                Ok(None) => break,
++                Err(error) => {
++                    warn!(%error, "named pipe read failed");
++                    break;
++                }
++            }
++        }
++    };
++    let writer = async {
++        while let Some(queued) = writer_rx.recv().await {
++            let Some(mut json) = serialize_outgoing_message(queued.message) else {
++                continue;
++            };
++            json.push('\n');
++            if let Err(error) = writer.write_all(json.as_bytes()).await {
++                warn!(%error, "named pipe write failed");
++                break;
++            }
++            if let Some(written) = queued.write_complete_tx {
++                let _ = written.send(());
++            }
++        }
++    };
++    tokio::select! {
++        _ = reader => {}
++        _ = writer => {}
++        _ = disconnect.cancelled() => {}
++        _ = shutdown.cancelled() => {}
++    }
++    let _ = transport_event_tx
++        .send(TransportEvent::ConnectionClosed { connection_id })
++        .await;
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_app_server_protocol::JSONRPCMessage;
++    use tokio::net::windows::named_pipe::ClientOptions;
++    use tokio::time::Duration;
++    use tokio::time::timeout;
++
++    #[tokio::test]
++    async fn named_pipe_accepts_current_user_jsonl_and_reports_close() -> io::Result<()> {
++        let pipe_name = format!(r"\\.\pipe\codex-app-server-test-{}", uuid::Uuid::now_v7());
++        let (events_tx, mut events_rx) = mpsc::channel(16);
++        let shutdown = CancellationToken::new();
++        let listener =
++            start_named_pipe_acceptor(pipe_name.clone(), events_tx, shutdown.clone()).await?;
++        let mut client = ClientOptions::new().open(&pipe_name)?;
++        let opened = timeout(Duration::from_secs(5), events_rx.recv())
++            .await
++            .map_err(io::Error::other)?
++            .ok_or_else(|| io::Error::other("transport event channel closed"))?;
++        let connection_id = match opened {
++            TransportEvent::ConnectionOpened {
++                connection_id,
++                origin: ConnectionOrigin::NamedPipe,
++                disconnect_sender: Some(_),
++                ..
++            } => connection_id,
++            other => return Err(io::Error::other(format!("unexpected event: {other:?}"))),
++        };
++
++        client
++            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
++            .await?;
++        let incoming = timeout(Duration::from_secs(5), events_rx.recv())
++            .await
++            .map_err(io::Error::other)?
++            .ok_or_else(|| io::Error::other("transport event channel closed"))?;
++        assert!(matches!(
++            incoming,
++            TransportEvent::IncomingMessage {
++                connection_id: observed,
++                message: JSONRPCMessage::Request(_),
++            } if observed == connection_id
++        ));
++
++        drop(client);
++        let closed = timeout(Duration::from_secs(5), events_rx.recv())
++            .await
++            .map_err(io::Error::other)?
++            .ok_or_else(|| io::Error::other("transport event channel closed"))?;
++        assert!(matches!(
++            closed,
++            TransportEvent::ConnectionClosed {
++                connection_id: observed,
++            } if observed == connection_id
++        ));
++        shutdown.cancel();
++        listener.await.map_err(io::Error::other)?;
++        Ok(())
++    }
++}
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index bddfc75a0d37b48c3a84d918d04e1a98c054f83a..c679538957a58ae24846fa54a6f7ed58d3205b35 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -129,11 +129,11 @@ tikv-jemallocator = { workspace = true }
+ libc = { workspace = true }
+ 
+ [target.'cfg(windows)'.dependencies]
++codex-uds = { workspace = true }
+ codex-windows-sandbox = { workspace = true }
+ 
+ [dev-dependencies]
+ zip = { workspace = true }
+-codex-uds = { workspace = true }
+ app_test_support = { workspace = true }
+ axum = { workspace = true, default-features = false, features = [
+     "http1",
+diff --git a/codex-rs/app-server/src/desktop_discovery.rs b/codex-rs/app-server/src/desktop_discovery.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..377fa4d5b03307bb835376d329078aa73e0bfe9c
+--- /dev/null
++++ b/codex-rs/app-server/src/desktop_discovery.rs
+@@ -0,0 +1,72 @@
++use serde::Serialize;
++use std::io;
++use std::path::Path;
++use std::path::PathBuf;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++
++const DISCOVERY_DIRECTORY: &str = "shared-app-server";
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct DesktopAppServerRecord<'a> {
++    schema_version: u8,
++    pid: u32,
++    pipe_name: &'a str,
++    executable_path: String,
++    app_server_version: &'static str,
++    instance_nonce: &'a str,
++    started_at_unix_ms: u128,
++}
++
++pub(crate) struct DesktopAppServerDiscovery {
++    path: PathBuf,
++    pub(crate) pipe_name: String,
++    nonce: String,
++}
++
++impl DesktopAppServerDiscovery {
++    pub(crate) async fn prepare(codex_home: &Path) -> io::Result<Self> {
++        let directory = codex_home.join(DISCOVERY_DIRECTORY);
++        codex_uds::prepare_private_socket_directory(&directory).await?;
++        let pid = std::process::id();
++        let nonce = uuid::Uuid::now_v7().to_string();
++        let pipe_name = format!(r"\\.\pipe\codex-app-server-{pid}-{nonce}");
++        let path = directory.join(format!("desktop-app-server-{pid}-{nonce}.json"));
++        Ok(Self {
++            path,
++            pipe_name,
++            nonce,
++        })
++    }
++
++    pub(crate) fn publish(&self) -> io::Result<()> {
++        let pid = std::process::id();
++        let temporary = self.path.with_extension("tmp");
++        let record = DesktopAppServerRecord {
++            schema_version: 1,
++            pid,
++            pipe_name: &self.pipe_name,
++            executable_path: std::env::current_exe()?.to_string_lossy().into_owned(),
++            app_server_version: env!("CARGO_PKG_VERSION"),
++            instance_nonce: &self.nonce,
++            started_at_unix_ms: SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map_err(io::Error::other)?
++                .as_millis(),
++        };
++        let json = serde_json::to_vec(&record).map_err(io::Error::other)?;
++        std::fs::write(&temporary, json)?;
++        if let Err(error) = std::fs::rename(&temporary, &self.path) {
++            let _ = std::fs::remove_file(&temporary);
++            return Err(error);
++        }
++        Ok(())
++    }
++}
++
++impl Drop for DesktopAppServerDiscovery {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_file(&self.path);
++    }
++}
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index ed787e10f9711d09ec697b2b57baa727c319ae44..545b80924de4f4455bec75cedbe53a62a90f4b5e 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -115,6 +115,8 @@ mod connection_cleanup;
+ mod connection_rpc_gate;
+ mod current_time;
+ mod daemon_thread_recovery;
++#[cfg(windows)]
++mod desktop_discovery;
+ mod dynamic_tools;
+ mod effective_plugin_change;
+ mod error_code;
+@@ -803,6 +805,8 @@ pub async fn run_main_with_transport_options(
+     // Remote enrollment must cancel before RPC drain without shutting down telemetry.
+     let remote_control_shutdown_token = transport_shutdown_token.child_token();
+     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
++    #[cfg(windows)]
++    let mut _desktop_discovery = None;
+ 
+     let websocket_compression = if config
+         .features
+@@ -828,6 +832,35 @@ pub async fn run_main_with_transport_options(
+             )
+             .await?;
+             transport_accept_handles.push(handle);
++            #[cfg(windows)]
++            {
++                match desktop_discovery::DesktopAppServerDiscovery::prepare(&config.codex_home)
++                    .await
++                {
++                    Ok(discovery) => {
++                        match codex_app_server_transport::start_named_pipe_acceptor(
++                            discovery.pipe_name.clone(),
++                            transport_event_tx.clone(),
++                            transport_shutdown_token.clone(),
++                        )
++                        .await
++                        {
++                            Ok(pipe_handle) => match discovery.publish() {
++                                Ok(()) => {
++                                    transport_accept_handles.push(pipe_handle);
++                                    _desktop_discovery = Some(discovery);
++                                }
++                                Err(error) => {
++                                    pipe_handle.abort();
++                                    warn!(%error, "shared app-server pipe discovery failed");
++                                }
++                            },
++                            Err(error) => warn!(%error, "shared app-server pipe binding failed"),
++                        }
++                    }
++                    Err(error) => warn!(%error, "shared app-server pipe preparation failed"),
++                }
++            }
+         }
+         AppServerTransport::UnixSocket { socket_path } => {
+             let accept_handle = start_control_socket_acceptor(
+diff --git a/codex-rs/app-server/src/outgoing_message.rs b/codex-rs/app-server/src/outgoing_message.rs
+index f893d3d20e38a845af4d3f216004ef1a67927825..c1f7656c1d017ea92f6c571c8ddbbcc53efa7f7a 100644
+--- a/codex-rs/app-server/src/outgoing_message.rs
++++ b/codex-rs/app-server/src/outgoing_message.rs
+@@ -134,6 +134,8 @@ pub(crate) struct OutgoingMessageSender {
+     next_server_request_id: AtomicI64,
+     sender: mpsc::Sender<OutgoingEnvelope>,
+     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
++    connection_owner_keys: Mutex<HashMap<ConnectionId, String>>,
++    thread_request_owners: Mutex<HashMap<ThreadId, ThreadRequestOwner>>,
+     /// Incoming requests that are still waiting on a final response or error.
+     /// We keep them here because this is where responses, errors, and
+     /// disconnect cleanup all get handled.
+@@ -150,6 +152,7 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
+ 
+ struct PendingCallbackEntry {
+     verification_owner: Option<ConnectionId>,
++    allowed_responder: Option<Option<ConnectionId>>,
+     verification_auth_revision: Option<u64>,
+     verification_identity: Option<user_verification_auth::Identity>,
+     callback: oneshot::Sender<ClientRequestResult>,
+@@ -158,6 +161,11 @@ struct PendingCallbackEntry {
+     _diagnostics_guard: GaugeGuard,
+ }
+ 
++struct ThreadRequestOwner {
++    key: Option<String>,
++    connection_id: Option<ConnectionId>,
++}
++
+ impl ThreadScopedOutgoingMessageSender {
+     pub(crate) fn new(
+         outgoing: Arc<OutgoingMessageSender>,
+@@ -256,6 +264,8 @@ impl OutgoingMessageSender {
+             next_server_request_id: AtomicI64::new(0),
+             sender,
+             request_id_to_callback: Mutex::new(HashMap::new()),
++            connection_owner_keys: Mutex::new(HashMap::new()),
++            thread_request_owners: Mutex::new(HashMap::new()),
+             request_contexts: Mutex::new(HashMap::new()),
+             analytics_events_client,
+         }
+@@ -292,10 +302,66 @@ impl OutgoingMessageSender {
+     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+         self.disconnect_user_verification_connection(connection_id)
+             .await;
++        self.connection_owner_keys
++            .lock()
++            .await
++            .remove(&connection_id);
++        let mut owners = self.thread_request_owners.lock().await;
++        owners.retain(|_, owner| {
++            if owner.connection_id == Some(connection_id) {
++                owner.connection_id = None;
++                owner.key.is_some()
++            } else {
++                true
++            }
++        });
++        drop(owners);
++        let mut pending = self.request_id_to_callback.lock().await;
++        for entry in pending.values_mut() {
++            if entry.allowed_responder == Some(Some(connection_id)) {
++                entry.allowed_responder = Some(None);
++            }
++        }
++        drop(pending);
+         let mut request_contexts = self.request_contexts.lock().await;
+         request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+     }
+ 
++    pub(crate) async fn register_connection_owner_key(
++        &self,
++        connection_id: ConnectionId,
++        key: String,
++    ) {
++        self.connection_owner_keys
++            .lock()
++            .await
++            .insert(connection_id, key);
++    }
++
++    pub(crate) async fn claim_thread_request_owner(
++        &self,
++        thread_id: ThreadId,
++        connection_id: ConnectionId,
++    ) {
++        let Some(key) = self
++            .connection_owner_keys
++            .lock()
++            .await
++            .get(&connection_id)
++            .cloned()
++        else {
++            self.thread_request_owners.lock().await.remove(&thread_id);
++            return;
++        };
++        self.thread_request_owners.lock().await.insert(
++            thread_id,
++            ThreadRequestOwner {
++                key: Some(key),
++                connection_id: Some(connection_id),
++            },
++        );
++    }
++
+     pub(crate) async fn request_trace_context(
+         &self,
+         request_id: &ConnectionRequestId,
+@@ -384,8 +450,21 @@ impl OutgoingMessageSender {
+         if user_verification && (verification_owner.is_none() || auth_changed()) {
+             return (outgoing_message_id, rx_approve);
+         }
++        let owned_connection = if user_verification {
++            None
++        } else if let Some(thread_id) = thread_id {
++            self.thread_request_owners
++                .lock()
++                .await
++                .get(&thread_id)
++                .map(|owner| owner.connection_id)
++        } else {
++            None
++        };
+         let connection_ids = if user_verification {
+             verification_owner.as_ref().map(std::slice::from_ref)
++        } else if let Some(owner) = owned_connection.as_ref() {
++            Some(owner.as_ref().map(std::slice::from_ref).unwrap_or(&[]))
+         } else {
+             connection_ids
+         };
+@@ -395,6 +474,7 @@ impl OutgoingMessageSender {
+                 id,
+                 PendingCallbackEntry {
+                     verification_owner,
++                    allowed_responder: owned_connection,
+                     verification_auth_revision,
+                     verification_identity: verification_identity.clone(),
+                     callback: tx_approve,
+@@ -465,6 +545,37 @@ impl OutgoingMessageSender {
+         connection_id: ConnectionId,
+         thread_id: ThreadId,
+     ) {
++        let connection_key = self
++            .connection_owner_keys
++            .lock()
++            .await
++            .get(&connection_id)
++            .cloned();
++        let mut owners = self.thread_request_owners.lock().await;
++        if let Some(owner) = owners.get_mut(&thread_id) {
++            if owner
++                .connection_id
++                .is_some_and(|active| active != connection_id)
++            {
++                return;
++            }
++            let Some(key) = connection_key else {
++                return;
++            };
++            if owner.key.as_deref() != Some(key.as_str()) {
++                return;
++            }
++            if owner.connection_id.is_none() {
++                owner.connection_id = Some(connection_id);
++            }
++            let mut pending = self.request_id_to_callback.lock().await;
++            for entry in pending.values_mut() {
++                if entry.thread_id == Some(thread_id) && entry.allowed_responder.is_some() {
++                    entry.allowed_responder = Some(Some(connection_id));
++                }
++            }
++        }
++        drop(owners);
+         let requests = self.pending_requests_for_thread(thread_id).await;
+         for request in requests {
+             if let Err(err) = self
+@@ -582,6 +693,11 @@ impl OutgoingMessageSender {
+     ) -> Option<(RequestId, PendingCallbackEntry)> {
+         let mut callbacks = self.request_id_to_callback.lock().await;
+         let entry = callbacks.get(id)?;
++        if let Some(owner) = entry.allowed_responder
++            && owner != Some(connection_id)
++        {
++            return None;
++        }
+         if let Some(owner) = entry.verification_owner {
+             if owner != connection_id {
+                 return None;
+@@ -1614,6 +1730,130 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn named_pipe_thread_request_only_accepts_its_owner() {
++        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
++        let outgoing = Arc::new(OutgoingMessageSender::new(
++            tx,
++            codex_analytics::AnalyticsEventsClient::disabled(),
++        ));
++        let thread_id = ThreadId::new();
++        outgoing
++            .register_connection_owner_key(ConnectionId(1), "instance-key".to_string())
++            .await;
++        outgoing
++            .claim_thread_request_owner(thread_id, ConnectionId(1))
++            .await;
++        let scoped = ThreadScopedOutgoingMessageSender::new(
++            outgoing.clone(),
++            vec![ConnectionId(1), ConnectionId(2)],
++            thread_id,
++        );
++        let (request_id, waiter) = scoped
++            .send_request(ServerRequestPayload::ToolRequestUserInput(
++                ToolRequestUserInputParams {
++                    thread_id: thread_id.to_string(),
++                    turn_id: "turn-1".to_string(),
++                    item_id: "call-1".to_string(),
++                    questions: vec![],
++                    is_blocking: true,
++                    auto_resolution_ms: None,
++                },
++            ))
++            .await;
++        assert!(matches!(
++            rx.try_recv(),
++            Ok(OutgoingEnvelope::ToConnection {
++                connection_id: ConnectionId(1),
++                ..
++            })
++        ));
++        assert!(rx.try_recv().is_err());
++        outgoing
++            .notify_client_response(ConnectionId(2), request_id.clone(), json!({}))
++            .await;
++        assert_eq!(
++            outgoing.pending_requests_for_thread(thread_id).await.len(),
++            1
++        );
++        outgoing
++            .notify_client_response(ConnectionId(1), request_id, json!({}))
++            .await;
++        assert_eq!(
++            waiter.await.expect("owner receives response"),
++            Ok(json!({}))
++        );
++    }
++
++    #[tokio::test]
++    async fn named_pipe_thread_request_replays_only_to_reconnected_owner() {
++        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
++        let outgoing = Arc::new(OutgoingMessageSender::new(
++            tx,
++            codex_analytics::AnalyticsEventsClient::disabled(),
++        ));
++        let thread_id = ThreadId::new();
++        outgoing
++            .register_connection_owner_key(ConnectionId(1), "instance-key".to_string())
++            .await;
++        outgoing
++            .claim_thread_request_owner(thread_id, ConnectionId(1))
++            .await;
++        outgoing.connection_closed(ConnectionId(1)).await;
++        let scoped = ThreadScopedOutgoingMessageSender::new(
++            outgoing.clone(),
++            vec![ConnectionId(2)],
++            thread_id,
++        );
++        let (request_id, waiter) = scoped
++            .send_request(ServerRequestPayload::ToolRequestUserInput(
++                ToolRequestUserInputParams {
++                    thread_id: thread_id.to_string(),
++                    turn_id: "turn-1".to_string(),
++                    item_id: "call-1".to_string(),
++                    questions: vec![],
++                    is_blocking: true,
++                    auto_resolution_ms: None,
++                },
++            ))
++            .await;
++        assert!(rx.try_recv().is_err());
++        outgoing
++            .register_connection_owner_key(ConnectionId(3), "other-instance".to_string())
++            .await;
++        outgoing
++            .replay_requests_to_connection_for_thread(ConnectionId(3), thread_id)
++            .await;
++        assert!(rx.try_recv().is_err());
++        outgoing
++            .register_connection_owner_key(ConnectionId(4), "instance-key".to_string())
++            .await;
++        outgoing
++            .replay_requests_to_connection_for_thread(ConnectionId(4), thread_id)
++            .await;
++        assert!(matches!(
++            rx.try_recv(),
++            Ok(OutgoingEnvelope::ToConnection {
++                connection_id: ConnectionId(4),
++                ..
++            })
++        ));
++        outgoing
++            .notify_client_response(ConnectionId(3), request_id.clone(), json!({}))
++            .await;
++        assert_eq!(
++            outgoing.pending_requests_for_thread(thread_id).await.len(),
++            1
++        );
++        outgoing
++            .notify_client_response(ConnectionId(4), request_id, json!({}))
++            .await;
++        assert_eq!(
++            waiter.await.expect("reconnected owner responds"),
++            Ok(json!({}))
++        );
++    }
++
+     #[tokio::test]
+     async fn cancel_requests_for_thread_cancels_all_thread_requests() {
+         let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(8);
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+index d68a29df9f364ed0836904847bae3927db1ae339..d7178ccbfafa8cd3e32d0fbdecd28160c0d88046 100644
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -95,6 +95,23 @@ impl InitializeRequestProcessor {
+             title: _title,
+             version,
+         } = params.client_info;
++        let thread_owner_key = if session.origin == ConnectionOrigin::NamedPipe {
++            if name != "omnicodex" {
++                return Err(invalid_request("shared app-server pipe requires OmniCodex"));
++            }
++            Some(
++                capabilities
++                    .extensions
++                    .as_ref()
++                    .and_then(|extensions| extensions.get("omnicodex/thread-owner-key"))
++                    .and_then(serde_json::Value::as_str)
++                    .filter(|key| uuid::Uuid::parse_str(key).is_ok())
++                    .ok_or_else(|| invalid_request("shared app-server pipe requires owner key"))?
++                    .to_string(),
++            )
++        } else {
++            None
++        };
+         // Validate before committing; set_default_originator validates while
+         // mutating process-global metadata.
+         if HeaderValue::from_str(&name).is_err() {
+@@ -129,7 +146,8 @@ impl InitializeRequestProcessor {
+         }
+         let originator = name.clone();
+         let user_agent_suffix = format!("{name}; {version}");
+-        let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
++        let mutates_global_identity = session.origin != ConnectionOrigin::NamedPipe
++            && !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
+         let codex_home = self.config.codex_home.clone();
+         if session
+             .initialize(InitializedConnectionSessionState {
+@@ -144,6 +162,11 @@ impl InitializeRequestProcessor {
+         {
+             return Err(invalid_request("Already initialized"));
+         }
++        if let Some(thread_owner_key) = thread_owner_key {
++            self.outgoing
++                .register_connection_owner_key(connection_id, thread_owner_key)
++                .await;
++        }
+         if user_verification_enabled {
+             self.outgoing
+                 .enable_user_verification_connection(connection_id)
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+index 1ce59c4cf4a0dcfd6087379e35d0532e5021a36b..b3f589425c65de9aa86364c033fd5425a26d4919 100644
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -658,6 +658,26 @@ impl TurnRequestProcessor {
+             )
+             .await?;
+ 
++        // A caller can start a turn on a loaded thread without first calling
++        // thread/resume. Attach it before submission so it receives every item
++        // and the terminal notification, including after a Desktop restart.
++        match self
++            .ensure_conversation_listener(
++                thread_id,
++                request_id.connection_id,
++                /*raw_events_enabled*/ false,
++            )
++            .await?
++        {
++            EnsureConversationListenerResult::Attached => {}
++            EnsureConversationListenerResult::ConnectionClosed => {
++                return Err(invalid_request("turn/start connection closed"));
++            }
++        }
++
++        self.outgoing
++            .claim_thread_request_owner(thread_id, request_id.connection_id)
++            .await;
+         let submission = thread
+             .start_or_steer_turn(
+                 TurnInputRequest::new(input)
+@@ -701,7 +721,6 @@ impl TurnRequestProcessor {
+                 return Err(error);
+             }
+         };
+-
+         if turn_has_input && started {
+             let config_snapshot = thread.config_snapshot().await;
+             if config_snapshot.is_primary_environment_configured() {
+diff --git a/codex-rs/app-server/src/user_verification.rs b/codex-rs/app-server/src/user_verification.rs
+index f7522228a024106112d3b03e56d4ff170e5ebd5e..0ebf8dfbdb0d6145a6631b07c839973f44148b95 100644
+--- a/codex-rs/app-server/src/user_verification.rs
++++ b/codex-rs/app-server/src/user_verification.rs
+@@ -64,7 +64,9 @@ impl Service {
+         // parent process; in-process calls belong to the embedded application.
+         if matches!(
+             origin,
+-            ConnectionOrigin::WebSocket | ConnectionOrigin::RemoteControl
++            ConnectionOrigin::WebSocket
++                | ConnectionOrigin::RemoteControl
++                | ConnectionOrigin::NamedPipe
+         ) && !matches!(operation, Operation::Status)
+         {
+             return Err(unavailable());
+diff --git a/codex-rs/app-server/src/user_verification_activation_tests.rs b/codex-rs/app-server/src/user_verification_activation_tests.rs
+index 336a58129263d5f5c5662511720b94043521efec..f32fd8c3828e96c76a2f31083da723f4031dc7db 100644
+--- a/codex-rs/app-server/src/user_verification_activation_tests.rs
++++ b/codex-rs/app-server/src/user_verification_activation_tests.rs
+@@ -15,6 +15,7 @@ async fn user_verification_initialize_owns_advertisement_and_eligibility() -> Re
+     for (origin, name, opt_in, supported, expected) in [
+         (ConnectionOrigin::InProcess, "codex-tui", true, true, true),
+         (ConnectionOrigin::WebSocket, "codex-tui", true, true, false),
++        (ConnectionOrigin::NamedPipe, "codex-tui", true, true, false),
+         (
+             ConnectionOrigin::RemoteControl,
+             "codex-tui",
+diff --git a/codex-rs/app-server/src/user_verification_test_support.rs b/codex-rs/app-server/src/user_verification_test_support.rs
+index 28a35ca1324d57241b9d5c229e3372968782bc34..e7c0a8a75e79b03a529d51e277f079e9f8de2abf 100644
+--- a/codex-rs/app-server/src/user_verification_test_support.rs
++++ b/codex-rs/app-server/src/user_verification_test_support.rs
+@@ -173,9 +173,9 @@ impl Harness {
+             code_mode_session_provider: None,
+             rpc_transport: match origin {
+                 ConnectionOrigin::InProcess => AppServerRpcTransport::InProcess,
+-                ConnectionOrigin::Stdio | ConnectionOrigin::RemoteControl => {
+-                    AppServerRpcTransport::Stdio
+-                }
++                ConnectionOrigin::Stdio
++                | ConnectionOrigin::RemoteControl
++                | ConnectionOrigin::NamedPipe => AppServerRpcTransport::Stdio,
+                 ConnectionOrigin::WebSocket => AppServerRpcTransport::Websocket,
+             },
+             remote_control_handle: None,
+@@ -198,7 +198,8 @@ impl Harness {
+                 // Keeping that case tests that authorization uses the connection's origin.
+                 ConnectionOrigin::Stdio
+                 | ConnectionOrigin::InProcess
+-                | ConnectionOrigin::RemoteControl => AppServerTransport::Stdio,
++                | ConnectionOrigin::RemoteControl
++                | ConnectionOrigin::NamedPipe => AppServerTransport::Stdio,
+             },
+         })
+     }
+diff --git a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+index e083aaa7655b8a0d90808ae5cefd28a6206e97eb..fa76b3aaab42edab5467429096ca2a18e3751039 100644
+--- a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
++++ b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+@@ -65,6 +65,59 @@ pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+ pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+ type HmacSha256 = Hmac<Sha256>;
+ 
++#[tokio::test]
++async fn turn_start_subscribes_calling_connection_without_thread_resume() -> Result<()> {
++    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
++    let codex_home = TempDir::new()?;
++    create_config_toml(codex_home.path(), &server.uri(), "never")?;
++    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
++    let mut creator = connect_websocket(bind_addr).await?;
++    let mut turn_caller = connect_websocket(bind_addr).await?;
++
++    send_initialize_request(&mut creator, /*id*/ 1, "creator").await?;
++    read_response_for_id(&mut creator, /*id*/ 1).await?;
++    send_initialize_request(&mut turn_caller, /*id*/ 2, "turn_caller").await?;
++    read_response_for_id(&mut turn_caller, /*id*/ 2).await?;
++
++    send_request(
++        &mut creator,
++        "thread/start",
++        /*id*/ 3,
++        Some(serde_json::to_value(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            ..Default::default()
++        })?),
++    )
++    .await?;
++    let ThreadStartResponse { thread, .. } =
++        to_response(read_response_for_id(&mut creator, /*id*/ 3).await?)?;
++
++    send_request(
++        &mut turn_caller,
++        "turn/start",
++        /*id*/ 4,
++        Some(json!({
++            "threadId": thread.id.clone(),
++            "input": [{"type": "text", "text": "continue"}],
++        })),
++    )
++    .await?;
++    let (_response, started) =
++        read_response_and_notification_for_method(&mut turn_caller, /*id*/ 4, "turn/started")
++            .await?;
++    assert_eq!(
++        started
++            .params
++            .as_ref()
++            .and_then(|params| params.get("threadId"))
++            .and_then(serde_json::Value::as_str),
++        Some(thread.id.as_str()),
++    );
++
++    process.kill().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> Result<()> {
+     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+diff --git a/codex-rs/uds/Cargo.toml b/codex-rs/uds/Cargo.toml
+index a985ebd3a69605ac4b6a6246267909cf00227c8b..c3685171c75817b2b83790ed6e12c82730735428 100644
+--- a/codex-rs/uds/Cargo.toml
++++ b/codex-rs/uds/Cargo.toml
+@@ -22,7 +22,7 @@ libc = { workspace = true }
+ async-io = { workspace = true }
+ tokio-util = { workspace = true, features = ["compat"] }
+ uds_windows = { workspace = true }
+-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_Networking_WinSock", "Win32_System_IO"] }
++windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Pipes"] }
+ 
+ [dev-dependencies]
+ pretty_assertions = { workspace = true }
+diff --git a/codex-rs/uds/src/lib.rs b/codex-rs/uds/src/lib.rs
+index 5fecf770be88848ed51514f2bfec0f354ae3318e..c5de39aaabd3f09ea352ea182679b361b60fe2f9 100644
+--- a/codex-rs/uds/src/lib.rs
++++ b/codex-rs/uds/src/lib.rs
+@@ -25,6 +25,13 @@ pub async fn prepare_private_socket_directory(socket_dir: impl AsRef<Path>) -> I
+     platform::prepare_private_socket_directory(socket_dir.as_ref()).await
+ }
+ 
++/// Verifies that a connected Windows named pipe belongs to the current,
++/// non-elevated user before accepting app-server requests from it.
++#[cfg(windows)]
++pub fn ensure_current_user_named_pipe_peer(pipe: std::os::windows::io::RawHandle) -> IoResult<()> {
++    windows_peer::ensure_current_user_named_pipe_peer(pipe)
++}
++
+ /// Returns whether `socket_path` points at a stale Unix socket rendezvous path.
+ ///
+ /// On Unix this checks the file type. On Windows, `uds_windows` represents the
+diff --git a/codex-rs/uds/src/windows_peer.rs b/codex-rs/uds/src/windows_peer.rs
+index 99a583555684adfe264c910683bbc66cd5ab45b4..ddddd8f9ffbf96d72e36cd5a7a20b8a166fe73ef 100644
+--- a/codex-rs/uds/src/windows_peer.rs
++++ b/codex-rs/uds/src/windows_peer.rs
+@@ -4,6 +4,7 @@
+ use std::io;
+ use std::os::windows::io::FromRawHandle;
+ use std::os::windows::io::OwnedHandle;
++use std::os::windows::io::RawHandle;
+ use std::os::windows::io::RawSocket;
+ use std::ptr;
+ 
+@@ -17,6 +18,7 @@ use windows_sys::Win32::Security::TOKEN_ELEVATION;
+ use windows_sys::Win32::Security::TOKEN_QUERY;
+ use windows_sys::Win32::Security::TOKEN_USER;
+ use windows_sys::Win32::Security::TokenElevation;
++use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+ use windows_sys::Win32::System::Threading::GetCurrentProcess;
+ use windows_sys::Win32::System::Threading::OpenProcess;
+ use windows_sys::Win32::System::Threading::OpenProcessToken;
+@@ -48,6 +50,25 @@ pub(super) fn ensure_non_elevated_peer(socket: RawSocket) -> io::Result<()> {
+             "socket peer PID unavailable",
+         ));
+     }
++    ensure_non_elevated_current_user_process(pid)
++}
++
++pub(super) fn ensure_current_user_named_pipe_peer(pipe: RawHandle) -> io::Result<()> {
++    let mut pid = 0u32;
++    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if pid == 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::PermissionDenied,
++            "named pipe peer PID unavailable",
++        ));
++    }
++    ensure_non_elevated_current_user_process(pid)
++}
++
++fn ensure_non_elevated_current_user_process(pid: u32) -> io::Result<()> {
++    let mut returned = 0;
+     let process = unsafe {
+         OpenProcess(
+             PROCESS_QUERY_LIMITED_INFORMATION,

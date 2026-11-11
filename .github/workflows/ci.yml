@@ -1,0 +1,39 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22.12.0', cache: npm}
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+        env: {OMNICODEX_REAL_RUNTIME_E2E: '0'}
+      - run: npm run build
+      - run: npm pack --dry-run --json
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Generate SBOM
+        run: npm sbom --sbom-format cyclonedx > omnicodex.cdx.json
+      - uses: actions/upload-artifact@v4
+        with: {name: sbom, path: omnicodex.cdx.json}
+  license-and-secret-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22.12.0', cache: npm}
+      - run: npm ci --ignore-scripts
+      - name: Package and attribution policy
+        run: npm test -- --run test/release-package-policy.test.ts
+      - name: Dependency license inventory
+        run: npm query ':not(.workspace)' --json > dependency-inventory.json
+      - uses: actions/upload-artifact@v4
+        with: {name: dependency-license-inventory, path: dependency-inventory.json}

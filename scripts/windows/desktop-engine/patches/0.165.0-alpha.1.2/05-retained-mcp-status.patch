@@ -1,0 +1,1338 @@
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 21c8d2327c4a3c2e3d6aab7cceb9b751c1aeed83..17b062157340d4430930613e20ad06f5f08f31d2 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -424,7 +424,6 @@ use codex_login::run_login_server;
+ use codex_mcp::McpRuntimeContext;
+ use codex_mcp::McpServerStatusSnapshot;
+ use codex_mcp::McpSnapshotDetail;
+-use codex_mcp::collect_mcp_server_status_snapshot_with_detail;
+ use codex_mcp::discover_supported_scopes;
+ use codex_mcp::read_mcp_resource as read_mcp_resource_without_thread;
+ use codex_mcp::resolve_oauth_scopes;
+diff --git a/codex-rs/app-server/src/request_processors/mcp_processor.rs b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+index 7bee469285d95e0029937451b085c6a237827fa5..06fb0f83cb7110bdca6cf5b3debb5b8d0b80e55f 100644
+--- a/codex-rs/app-server/src/request_processors/mcp_processor.rs
++++ b/codex-rs/app-server/src/request_processors/mcp_processor.rs
+@@ -4,11 +4,13 @@ use super::thread_input::ensure_direct_input_allowed;
+ use super::*;
+ use codex_config::types::McpServerAuth;
+ use codex_mcp::McpServerSource;
++use codex_mcp::McpStatusScope;
+ use codex_mcp::ReadResourceRequestParams;
+ use codex_mcp::ema_auth_scope;
+ use codex_mcp::resolve_oauth_callback;
+ use codex_otel::auth_storage::AuthStorageOriginator;
+ use codex_rmcp_client::EnterpriseOAuthLoginRequest;
++use std::collections::HashSet;
+ use std::future::Future;
+ 
+ use crate::thread_state::ThreadStateManager;
+@@ -440,7 +442,65 @@ impl McpRequestProcessor {
+                     ),
+                 ),
+             };
+-            let mut snapshot = collect_mcp_server_status_snapshot_with_detail(
++            let effective_server_names =
++                codex_mcp::effective_mcp_servers(&mcp_config, auth.as_ref())
++                    .into_keys()
++                    .filter(|name| {
++                        params
++                            .server_name
++                            .as_ref()
++                            .is_none_or(|selected| name == selected)
++                    })
++                    .collect::<HashSet<_>>();
++            let expected_registrations = effective_server_names
++                .iter()
++                .filter_map(|name| {
++                    let registration = mcp_config.mcp_server_catalog.server(name)?;
++                    (!matches!(registration.config().auth, McpServerAuth::EmaAuth))
++                        .then(|| (name.clone(), registration.clone()))
++                })
++                .collect();
++            let mut live_snapshot = match thread.as_ref() {
++                Some(thread) => match thread
++                    .mcp_servers_status_snapshot(&expected_registrations, detail)
++                    .await
++                {
++                    Ok((_, snapshot)) => Some(snapshot),
++                    Err(error) => {
++                        tracing::warn!(%error, "thread MCP status unavailable; using status connections");
++                        None
++                    }
++                },
++                None => None,
++            };
++            let served_names = live_snapshot
++                .as_ref()
++                .map(|snapshot| {
++                    snapshot
++                        .server_names
++                        .iter()
++                        .cloned()
++                        .collect::<HashSet<_>>()
++                })
++                .unwrap_or_default();
++            let fallback_names = effective_server_names
++                .difference(&served_names)
++                .cloned()
++                .collect::<HashSet<_>>();
++            let scope = match params.thread_id.as_deref() {
++                Some(thread_id) => McpStatusScope::Thread {
++                    thread_id: thread_id.to_owned(),
++                    auth_originator: AuthStorageOriginator::current().as_str().to_owned(),
++                    selected_server: params.server_name.clone(),
++                },
++                None => McpStatusScope::Threadless {
++                    auth_originator: AuthStorageOriginator::current().as_str().to_owned(),
++                    selected_server: params.server_name.clone(),
++                },
++            };
++            let mut snapshot = codex_mcp::collect_mcp_server_status_snapshot_retained(
++                &mcp_manager.status_connections(),
++                scope,
+                 &mcp_config,
+                 auth.as_ref(),
+                 Some(&self.auth_manager),
+@@ -449,15 +509,25 @@ impl McpRequestProcessor {
+                 mcp_manager.tool_catalog_cache(),
+                 detail,
+                 params.server_name.as_deref(),
++                thread.as_ref().map(|_| &fallback_names),
+             )
+             .await;
++            if let Some(live_snapshot) = live_snapshot.as_mut() {
++                for name in live_snapshot.server_names.clone() {
++                    snapshot.replace_server(&name, live_snapshot);
++                }
++            }
+             if mcp_config.xaa_enabled
+                 && let Some(thread) = thread.as_ref()
+             {
+-                // EMA can only use its admitted thread connection. Keep ordinary
+-                // status discovery unchanged and replace the threadless EMA results.
++                // EMA can only use its admitted thread connection.
+                 for (name, server) in mcp_config.mcp_server_catalog.configured_servers() {
+-                    if !matches!(server.auth, McpServerAuth::EmaAuth) {
++                    if !matches!(server.auth, McpServerAuth::EmaAuth)
++                        || params
++                            .server_name
++                            .as_deref()
++                            .is_some_and(|selected| name.as_str() != selected)
++                    {
+                         continue;
+                     }
+                     let (selected_config, mut selected) = thread
+@@ -475,28 +545,7 @@ impl McpRequestProcessor {
+                     {
+                         continue;
+                     }
+-                    snapshot.server_infos.remove(&name);
+-                    snapshot.server_infos.extend(selected.server_infos);
+-                    snapshot.server_capabilities.remove(&name);
+-                    if let Some(capabilities) = selected.server_capabilities.remove(&name) {
+-                        snapshot
+-                            .server_capabilities
+-                            .insert(name.clone(), capabilities);
+-                    }
+-                    snapshot.tools_by_server.remove(&name);
+-                    snapshot.tools_by_server.extend(selected.tools_by_server);
+-                    snapshot.tool_list_meta.remove(&name);
+-                    snapshot.tool_list_meta.extend(selected.tool_list_meta);
+-                    snapshot.tools_errors.remove(&name);
+-                    snapshot.tools_errors.extend(selected.tools_errors);
+-                    snapshot.resources.remove(&name);
+-                    snapshot.resources.extend(selected.resources);
+-                    snapshot.resource_templates.remove(&name);
+-                    snapshot
+-                        .resource_templates
+-                        .extend(selected.resource_templates);
+-                    snapshot.auth_statuses.remove(&name);
+-                    snapshot.auth_statuses.extend(selected.auth_statuses);
++                    snapshot.replace_server(&name, &mut selected);
+                 }
+             }
+             (Arc::new(mcp_config), snapshot)
+diff --git a/codex-rs/app-server/tests/suite/v2/mcp_server_status.rs b/codex-rs/app-server/tests/suite/v2/mcp_server_status.rs
+index c7dc29539e50e76953dc7ba14446bb9bb712aac8..68aa63d500dc8e43da953b4f86d9d5b059bccd16 100644
+--- a/codex-rs/app-server/tests/suite/v2/mcp_server_status.rs
++++ b/codex-rs/app-server/tests/suite/v2/mcp_server_status.rs
+@@ -446,12 +446,12 @@ async fn oauth_login_rejects_servers_disabled_by_managed_requirements(
+     Ok(())
+ }
+ 
+-async fn wait_for_new_pid(path: &Path, previous_pid: Option<&str>) -> Result<String> {
++async fn wait_for_pid(path: &Path) -> Result<String> {
+     Ok(timeout(DEFAULT_READ_TIMEOUT, async {
+         loop {
+             if let Ok(contents) = std::fs::read_to_string(path) {
+                 let pid = contents.trim();
+-                if !pid.is_empty() && Some(pid) != previous_pid {
++                if !pid.is_empty() {
+                     return pid.to_string();
+                 }
+             }
+@@ -834,8 +834,8 @@ async fn mcp_server_status_list_returns_raw_server_and_tool_names(plugin: bool)
+ }
+ 
+ #[tokio::test]
+-async fn mcp_server_status_list_waits_for_live_stdio_metadata_before_using_cached_tools()
+--> Result<()> {
++async fn mcp_server_status_list_reuses_live_stdio_metadata_without_restarting_server() -> Result<()>
++{
+     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+     let codex_home = TempDir::new()?;
+     let barrier_file = codex_home.path().join("allow-initialize");
+@@ -876,7 +876,7 @@ MCP_TEST_PID_FILE = {}
+             },
+         })
+         .await?;
+-    let first_pid = wait_for_new_pid(&pid_file, /*previous_pid*/ None).await?;
++    let first_pid = wait_for_pid(&pid_file).await?;
+     assert_dynamic_status(&first_response, &format!("rmcp-test-process-{first_pid}"));
+ 
+     std::fs::remove_file(&barrier_file)?;
+@@ -889,21 +889,10 @@ MCP_TEST_PID_FILE = {}
+             thread_id: None,
+         })
+         .await?;
+-    let second_pid = wait_for_new_pid(&pid_file, Some(&first_pid)).await?;
+-    assert!(
+-        timeout(
+-            Duration::from_millis(200),
+-            mcp.read_stream_until_response_message(RequestId::Integer(second_request_id)),
+-        )
+-        .await
+-        .is_err(),
+-        "status/list should wait for the live stdio server to initialize"
+-    );
+-
+-    std::fs::write(&barrier_file, "ready")?;
+     let second_response: ListMcpServerStatusResponse =
+-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(second_request_id)).await??;
+-    assert_dynamic_status(&second_response, &format!("rmcp-test-process-{second_pid}"));
++        timeout(Duration::from_secs(5), mcp.read_response(second_request_id)).await??;
++    assert_dynamic_status(&second_response, &format!("rmcp-test-process-{first_pid}"));
++    assert_eq!(std::fs::read_to_string(&pid_file)?.trim(), first_pid);
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/codex-mcp/src/connection_manager.rs b/codex-rs/codex-mcp/src/connection_manager.rs
+index 125d934cb048b79b62fd60a86e99646580ed928c..4e9285609ef4905d4f155ccffaa349ce6b2e62e2 100644
+--- a/codex-rs/codex-mcp/src/connection_manager.rs
++++ b/codex-rs/codex-mcp/src/connection_manager.rs
+@@ -36,6 +36,7 @@ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::atomic::Ordering;
+ use std::time::Duration;
++use std::time::Instant;
+ 
+ use crate::binding::call_tool_result_from_rmcp;
+ use crate::catalog::McpServerSource;
+@@ -90,10 +91,12 @@ use tokio::task::JoinSet;
+ use tracing::warn;
+ 
+ static LIVE_CONNECTIONS: Gauge = Gauge::new("mcp.connections.live");
++const STATUS_FAILED_STARTUP_RETRY_DELAY: Duration = Duration::from_secs(120);
+ 
+ pub(crate) struct McpServerConnection {
+     identity: Option<McpServerConnectionIdentity>,
+     client: AsyncManagedClient,
++    created_at: Instant,
+     // Startup-only budget; changing it must not replace a ready connection.
+     startup_timeout: Duration,
+     startup_trigger: Option<watch::Sender<bool>>,
+@@ -294,6 +297,48 @@ impl McpConnectionSet {
+         publication_gate: McpPublicationGate,
+         input: McpRuntimeInput,
+         elicitation_router: ElicitationRequestRouter,
++    ) -> Self {
++        Self::new_inner(
++            ema_auth,
++            existing_ema,
++            previous,
++            publication_gate,
++            input,
++            elicitation_router,
++            None,
++        )
++        .await
++    }
++
++    pub(crate) async fn new_for_status(
++        ema_auth: Option<crate::ema_auth::EmaAuthContext>,
++        existing_ema: Option<&Self>,
++        previous: Option<&Self>,
++        publication_gate: McpPublicationGate,
++        input: McpRuntimeInput,
++        elicitation_router: ElicitationRequestRouter,
++    ) -> Self {
++        Self::new_inner(
++            ema_auth,
++            existing_ema,
++            previous,
++            publication_gate,
++            input,
++            elicitation_router,
++            Some(STATUS_FAILED_STARTUP_RETRY_DELAY),
++        )
++        .await
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    async fn new_inner(
++        ema_auth: Option<crate::ema_auth::EmaAuthContext>,
++        existing_ema: Option<&Self>,
++        previous: Option<&Self>,
++        publication_gate: McpPublicationGate,
++        input: McpRuntimeInput,
++        elicitation_router: ElicitationRequestRouter,
++        failed_startup_retry_delay: Option<Duration>,
+     ) -> Self {
+         let trusted_access = TrustedAccessContext::from_runtime(&input);
+         let McpRuntimeInput {
+@@ -668,8 +713,28 @@ impl McpConnectionSet {
+                 } else {
+                     None
+                 };
++                let recent_status_failure = if failed_startup_retry_delay.is_some_and(|delay| {
++                    connection.created_at.elapsed() < delay
++                        && connection.identity.as_ref() == Some(&connection_identity)
++                        && connection.startup_timeout == startup_timeout
++                        && previous_view.catalog_item_limit == catalog_item_limit
++                        && previous_view.protocol_mode == protocol_mode
++                        && expected_protocol_mode.is_some()
++                        && connection.client.startup_complete.load(Ordering::Acquire)
++                        && !connection.client.cancel_token.is_cancelled()
++                }) {
++                    connection
++                        .client()
++                        .await
++                        .err()
++                        .filter(|error| matches!(error, StartupOutcomeError::Failed { .. }))
++                } else {
++                    None
++                };
++                let cached_failure_is_auth = unchanged_auth_failure.is_some();
++                let cached_failure = unchanged_auth_failure.or(recent_status_failure);
+                 if reusable_pending_startup
+-                    || unchanged_auth_failure.is_some()
++                    || cached_failure.is_some()
+                     || connection
+                         .reusable_client(&connection_identity)
+                         .await
+@@ -696,12 +761,16 @@ impl McpConnectionSet {
+                             catalog_item_limit,
+                         },
+                     );
+-                    if let Some(error) = unchanged_auth_failure {
+-                        let reason = connection_identity
+-                            .oauth_credentials()
+-                            .ok()
+-                            .flatten()
+-                            .map(|_| McpStartupFailureReason::ReauthenticationRequired);
++                    if let Some(error) = cached_failure {
++                        let reason = if cached_failure_is_auth {
++                            connection_identity
++                                .oauth_credentials()
++                                .ok()
++                                .flatten()
++                                .map(|_| McpStartupFailureReason::ReauthenticationRequired)
++                        } else {
++                            None
++                        };
+                         let status = McpStartupStatus::Failed {
+                             error: mcp_init_error_display(
+                                 &server_name,
+@@ -826,6 +895,7 @@ impl McpConnectionSet {
+                     connection: Arc::new(McpServerConnection {
+                         identity: Some(connection_identity),
+                         client: async_managed_client.clone(),
++                        created_at: Instant::now(),
+                         startup_timeout,
+                         startup_trigger,
+                         _diagnostics_guard: LIVE_CONNECTIONS.track(),
+@@ -1108,6 +1178,14 @@ impl McpConnectionSet {
+             || view.connection.client_for_call().await.is_ok()
+     }
+ 
++    /// Status polling observes the initial startup without joining a background reconnect.
++    pub(crate) async fn wait_for_status_server_startup(&self, server_name: &str) -> bool {
++        let Some(view) = self.servers.get(server_name) else {
++            return false;
++        };
++        view.connection.client.ready_transport().is_some() || view.connection.client().await.is_ok()
++    }
++
+     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
+     pub async fn shutdown(&self) {
+         let connections = self
+diff --git a/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs b/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs
+index 07e149e527c6317ef8abc9372c6f94ecbb418d8b..270a4b2fa8c61aab5bff113647ccd29c10057e7c 100644
+--- a/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs
++++ b/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs
+@@ -77,6 +77,58 @@ enum PendingCallToolInfo {
+ }
+ 
+ impl McpConnectionSet {
++    /// Status polling reuses the process, but still asks each reused client for its current tools.
++    pub(crate) async fn refresh_reused_status_catalogs(
++        &self,
++        previous: &Self,
++    ) -> HashMap<String, String> {
++        join_all(self.servers.iter().filter_map(|(server_name, view)| {
++            previous
++                .servers
++                .get(server_name)
++                .is_some_and(|old| Arc::ptr_eq(&view.connection, &old.connection))
++                .then_some(async move {
++                    // Apps keeps its shared connector cache. A status poll must not publish
++                    // a hard refresh into the catalog used by active thread runtimes.
++                    if view.connection.client.is_codex_apps_mcp_server {
++                        return None;
++                    }
++
++                    let client = match view.connection.client().await {
++                        Ok(client) => client,
++                        Err(error) => return Some((server_name.clone(), error.to_string())),
++                    };
++                    let result = client
++                        .tool_catalog
++                        .refresh(
++                            || async {
++                                let (tools, meta) = list_tools_for_client_uncached(
++                                    server_name,
++                                    /*is_codex_apps_mcp_server*/ false,
++                                    "status",
++                                    &client.client,
++                                    Some(view.refresh_timeout),
++                                    view.catalog_item_limit,
++                                    client.server_instructions.as_deref(),
++                                )
++                                .await?;
++                                Ok((tools, meta, ()))
++                            },
++                            |_, _, _| (),
++                        )
++                        .await;
++                    result.err().map(|error| {
++                        tracing::warn!(server_name = %server_name, %error, "failed to refresh reused MCP status catalog");
++                        (server_name.clone(), format!("{error:#}"))
++                    })
++                })
++        }))
++        .await
++        .into_iter()
++        .flatten()
++        .collect()
++    }
++
+     /// Observes opted-in servers at startup gates without waiting or cloning catalogs.
+     pub(crate) fn record_startup_readiness(
+         &self,
+diff --git a/codex-rs/codex-mcp/src/connection_manager_tests.rs b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+index 06e4c3b8d53d68763b18f8d2dd4822bf23bb1e13..751c65942f0539375674b7bc89745878493af0c1 100644
+--- a/codex-rs/codex-mcp/src/connection_manager_tests.rs
++++ b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+@@ -146,6 +146,7 @@ impl McpConnectionSet {
+                 connection: Arc::new(McpServerConnection {
+                     identity: None,
+                     client,
++                    created_at: Instant::now(),
+                     startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+                     startup_trigger: None,
+                     _diagnostics_guard: LIVE_CONNECTIONS.track(),
+@@ -601,6 +602,49 @@ pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> A
+     }
+ }
+ 
++#[tokio::test]
++async fn reused_apps_status_keeps_the_shared_catalog_without_a_hard_refresh() {
++    let mut previous = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
++    let mut client = create_ready_async_managed_client(Vec::new()).await;
++    client.is_codex_apps_mcp_server = true;
++    client.client = futures::future::pending().boxed().shared();
++    previous.insert_test_client(CODEX_APPS_MCP_SERVER_NAME, client);
++
++    let mut current = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
++    current.servers.insert(
++        CODEX_APPS_MCP_SERVER_NAME.to_string(),
++        previous.servers[CODEX_APPS_MCP_SERVER_NAME].clone(),
++    );
++    let errors = tokio::time::timeout(
++        Duration::from_secs(1),
++        current.refresh_reused_status_catalogs(&previous),
++    )
++    .await
++    .expect("status must not start a Codex Apps hard refresh");
++    assert!(errors.is_empty());
++}
++
++#[tokio::test]
++async fn reused_status_reports_a_client_refresh_failure() {
++    let mut previous = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
++    let mut client = create_ready_async_managed_client(Vec::new()).await;
++    client.client = futures::future::ready(Err(StartupOutcomeError::Failed {
++        error: "fixture connection failed".to_string(),
++        is_authentication_required: false,
++        is_ema_authentication_required: false,
++    }))
++    .boxed()
++    .shared();
++    previous.insert_test_client("broken", client);
++
++    let mut current = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
++    current
++        .servers
++        .insert("broken".to_string(), previous.servers["broken"].clone());
++    let errors = current.refresh_reused_status_catalogs(&previous).await;
++    assert!(errors["broken"].contains("fixture connection failed"));
++}
++
+ #[tokio::test]
+ async fn connection_statuses_observe_clients_without_starting_them() {
+     use codex_protocol::mcp::McpServerConnectionStatus as Status;
+@@ -5384,6 +5428,7 @@ async fn manager_with_reusable_ready_server(
+             connection: Arc::new(McpServerConnection {
+                 identity: Some(reusable_server_identity("docs", config, runtime_context)),
+                 client: create_ready_async_managed_client(tools).await,
++                created_at: Instant::now(),
+                 startup_timeout: config
+                     .startup_timeout_sec
+                     .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
+@@ -5422,42 +5467,74 @@ async fn reconcile_reusable_server_with_mcp_config(
+     runtime_context: McpRuntimeContext,
+     mcp_config: crate::McpConfig,
+ ) -> McpConnectionSet {
+-    let (tx_event, _rx_event) = async_channel::unbounded();
+-    McpConnectionSet::new(
+-        /*ema_auth*/ None,
+-        /*existing_ema*/ None,
+-        Some(previous),
+-        McpPublicationGate::already_published(),
+-        McpRuntimeInput {
+-            network_policy_metadata: None,
+-            startup_policy: McpStartupPolicy::Eager,
+-            config: Arc::new(mcp_config),
+-            plugins_available: false,
+-            ready_selected_capability_roots: Vec::new(),
+-            mcp_servers: HashMap::from([(
+-                server_name.to_string(),
+-                EffectiveMcpServer::from_host_config(config),
+-            )]),
+-            submit_id: "refresh".to_string(),
+-            tx_event: Some(tx_event),
+-            startup_cancellation_token: CancellationToken::new(),
+-            runtime_context,
+-            codex_apps_tools_cache: ConnectorRuntimeManager::default(),
+-            tool_catalog_cache: McpToolCatalogCache::default(),
+-            codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(
+-                /*account_id*/ None, /*chatgpt_user_id*/ None,
+-            ),
+-            client_mcp_extensions: ClientMcpExtensions::default(),
+-            auth: None,
+-            auth_manager: None,
+-            elicitation_reviewer: None,
+-            elicitation_lifecycle: None,
+-        },
+-        ElicitationRequestRouter::default(),
++    reconcile_reusable_server_with_mcp_config_and_mode(
++        previous,
++        server_name,
++        config,
++        runtime_context,
++        mcp_config,
++        false,
+     )
+     .await
+ }
+ 
++async fn reconcile_reusable_server_with_mcp_config_and_mode(
++    previous: &McpConnectionSet,
++    server_name: &str,
++    config: McpServerConfig,
++    runtime_context: McpRuntimeContext,
++    mcp_config: crate::McpConfig,
++    for_status: bool,
++) -> McpConnectionSet {
++    let (tx_event, _rx_event) = async_channel::unbounded();
++    let input = McpRuntimeInput {
++        network_policy_metadata: None,
++        startup_policy: McpStartupPolicy::Eager,
++        config: Arc::new(mcp_config),
++        plugins_available: false,
++        ready_selected_capability_roots: Vec::new(),
++        mcp_servers: HashMap::from([(
++            server_name.to_string(),
++            EffectiveMcpServer::from_host_config(config),
++        )]),
++        submit_id: "refresh".to_string(),
++        tx_event: Some(tx_event),
++        startup_cancellation_token: CancellationToken::new(),
++        runtime_context,
++        codex_apps_tools_cache: ConnectorRuntimeManager::default(),
++        tool_catalog_cache: McpToolCatalogCache::default(),
++        codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(
++            /*account_id*/ None, /*chatgpt_user_id*/ None,
++        ),
++        client_mcp_extensions: ClientMcpExtensions::default(),
++        auth: None,
++        auth_manager: None,
++        elicitation_reviewer: None,
++        elicitation_lifecycle: None,
++    };
++    if for_status {
++        McpConnectionSet::new_for_status(
++            None,
++            None,
++            Some(previous),
++            McpPublicationGate::already_published(),
++            input,
++            ElicitationRequestRouter::default(),
++        )
++        .await
++    } else {
++        McpConnectionSet::new(
++            None,
++            None,
++            Some(previous),
++            McpPublicationGate::already_published(),
++            input,
++            ElicitationRequestRouter::default(),
++        )
++        .await
++    }
++}
++
+ #[tokio::test]
+ async fn read_only_policy_does_not_reuse_a_writable_connection() {
+     let codex_home = tempdir().expect("tempdir");
+@@ -5835,6 +5912,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
+                     startup_reconnect: None,
+                     cancel_token: CancellationToken::new(),
+                 },
++                created_at: Instant::now(),
+                 startup_timeout: config
+                     .startup_timeout_sec
+                     .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
+@@ -6138,6 +6216,54 @@ async fn reconciliation_retries_non_oauth_authentication_failures() {
+     assert!(!previous.shares_test_connection_with(&reconciled, "docs"));
+ }
+ 
++#[tokio::test]
++async fn status_reconciliation_delays_retries_after_failed_startup() {
++    let runtime_context = reusable_server_runtime_context();
++    let config = reusable_server_config("http://127.0.0.1:1");
++    let mut previous =
++        manager_with_reusable_ready_server(&config, &runtime_context, Vec::new()).await;
++    let connection =
++        Arc::get_mut(&mut previous.servers.get_mut("docs").expect("server").connection)
++            .expect("test server has one connection owner");
++    connection.client.client = futures::future::ready(Err(StartupOutcomeError::Failed {
++        error: "temporary server failure".to_string(),
++        is_authentication_required: false,
++        is_ema_authentication_required: false,
++    }))
++    .boxed()
++    .shared();
++
++    let codex_home = tempdir().expect("tempdir");
++    let mcp_config = crate::mcp::tests::test_mcp_config(codex_home.path().to_path_buf());
++    let recent = reconcile_reusable_server_with_mcp_config_and_mode(
++        &previous,
++        "docs",
++        config.clone(),
++        runtime_context.clone(),
++        mcp_config.clone(),
++        true,
++    )
++    .await;
++    assert!(previous.shares_test_connection_with(&recent, "docs"));
++    drop(recent);
++
++    let connection =
++        Arc::get_mut(&mut previous.servers.get_mut("docs").expect("server").connection)
++            .expect("cached status connection is no longer shared");
++    connection.created_at =
++        Instant::now() - STATUS_FAILED_STARTUP_RETRY_DELAY - Duration::from_secs(1);
++    let retried = reconcile_reusable_server_with_mcp_config_and_mode(
++        &previous,
++        "docs",
++        config,
++        runtime_context,
++        mcp_config,
++        true,
++    )
++    .await;
++    assert!(!previous.shares_test_connection_with(&retried, "docs"));
++}
++
+ #[test]
+ fn connection_identity_tracks_only_oauth_credentials_when_oauth_is_active() {
+     let runtime_context = reusable_server_runtime_context();
+@@ -6663,6 +6789,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
+             startup_reconnect: None,
+             cancel_token: CancellationToken::new(),
+         },
++        created_at: Instant::now(),
+         startup_timeout: config
+             .startup_timeout_sec
+             .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
+diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
+index 71db3cb5a729784aa7571b8dd652858538e1d14e..12e37bc706c85667701c8fab8c860a324499c23b 100644
+--- a/codex-rs/codex-mcp/src/lib.rs
++++ b/codex-rs/codex-mcp/src/lib.rs
+@@ -89,6 +89,9 @@ pub use plugin_config::parse_plugin_mcp_declarations;
+ 
+ pub use mcp::McpServerStatusSnapshot;
+ pub use mcp::McpSnapshotDetail;
++pub use mcp::McpStatusConnections;
++pub use mcp::McpStatusScope;
++pub use mcp::collect_mcp_server_status_snapshot_retained;
+ pub use mcp::collect_mcp_server_status_snapshot_with_detail;
+ pub use mcp::read_mcp_resource;
+ 
+diff --git a/codex-rs/codex-mcp/src/mcp/mod.rs b/codex-rs/codex-mcp/src/mcp/mod.rs
+index fa5242e3e7a122bf7d78fb6ee9b2945cf3fd0129..f95fa2eb2c406fa00ffe98aa3f26248cb04e21ac 100644
+--- a/codex-rs/codex-mcp/src/mcp/mod.rs
++++ b/codex-rs/codex-mcp/src/mcp/mod.rs
+@@ -11,6 +11,9 @@ pub use auth::resolve_oauth_scopes;
+ pub use auth::should_retry_without_scopes;
+ 
+ pub(crate) mod auth;
++mod status_connections;
++pub use status_connections::McpStatusConnections;
++pub use status_connections::McpStatusScope;
+ 
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+@@ -511,6 +514,44 @@ pub struct McpServerStatusSnapshot {
+     pub server_names: Vec<String>,
+ }
+ 
++impl McpServerStatusSnapshot {
++    /// Replaces one server's status while keeping other server results intact.
++    pub fn replace_server(&mut self, name: &str, source: &mut Self) {
++        replace_server_entry(&mut self.server_infos, &mut source.server_infos, name);
++        replace_server_entry(
++            &mut self.server_capabilities,
++            &mut source.server_capabilities,
++            name,
++        );
++        replace_server_entry(&mut self.tool_list_meta, &mut source.tool_list_meta, name);
++        replace_server_entry(&mut self.tools_by_server, &mut source.tools_by_server, name);
++        replace_server_entry(&mut self.tools_errors, &mut source.tools_errors, name);
++        replace_server_entry(&mut self.resources, &mut source.resources, name);
++        replace_server_entry(
++            &mut self.resource_templates,
++            &mut source.resource_templates,
++            name,
++        );
++        replace_server_entry(&mut self.auth_statuses, &mut source.auth_statuses, name);
++        if source.server_names.iter().any(|server| server == name)
++            && !self.server_names.iter().any(|server| server == name)
++        {
++            self.server_names.push(name.to_owned());
++        }
++    }
++}
++
++fn replace_server_entry<Value>(
++    target: &mut HashMap<String, Value>,
++    source: &mut HashMap<String, Value>,
++    name: &str,
++) {
++    target.remove(name);
++    if let Some(value) = source.remove(name) {
++        target.insert(name.to_owned(), value);
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub async fn collect_mcp_server_status_snapshot_with_detail(
+     config: &McpConfig,
+@@ -521,10 +562,73 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
+     tool_catalog_cache: crate::McpToolCatalogCache,
+     detail: McpSnapshotDetail,
+     server_name: Option<&str>,
++) -> McpServerStatusSnapshot {
++    collect_mcp_server_status_snapshot_impl(
++        None,
++        config,
++        auth,
++        auth_manager,
++        runtime_context,
++        codex_apps_tools_cache,
++        tool_catalog_cache,
++        detail,
++        server_name,
++        None,
++    )
++    .await
++}
++
++#[allow(clippy::too_many_arguments)]
++pub async fn collect_mcp_server_status_snapshot_retained(
++    status_connections: &McpStatusConnections,
++    scope: McpStatusScope,
++    config: &McpConfig,
++    auth: Option<&CodexAuth>,
++    auth_manager: Option<&Arc<codex_login::AuthManager>>,
++    runtime_context: McpRuntimeContext,
++    codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
++    tool_catalog_cache: crate::McpToolCatalogCache,
++    detail: McpSnapshotDetail,
++    server_name: Option<&str>,
++    include_servers: Option<&HashSet<String>>,
++) -> McpServerStatusSnapshot {
++    collect_mcp_server_status_snapshot_impl(
++        Some((status_connections, scope)),
++        config,
++        auth,
++        auth_manager,
++        runtime_context,
++        codex_apps_tools_cache,
++        tool_catalog_cache,
++        detail,
++        server_name,
++        include_servers,
++    )
++    .await
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn collect_mcp_server_status_snapshot_impl(
++    retention: Option<(&McpStatusConnections, McpStatusScope)>,
++    config: &McpConfig,
++    auth: Option<&CodexAuth>,
++    auth_manager: Option<&Arc<codex_login::AuthManager>>,
++    runtime_context: McpRuntimeContext,
++    codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
++    tool_catalog_cache: crate::McpToolCatalogCache,
++    detail: McpSnapshotDetail,
++    server_name: Option<&str>,
++    include_servers: Option<&HashSet<String>>,
+ ) -> McpServerStatusSnapshot {
+     let mut mcp_servers = effective_mcp_servers(config, auth);
+-    mcp_servers.retain(|name, _| server_name.is_none_or(|selected| name == selected));
++    mcp_servers.retain(|name, _| {
++        server_name.is_none_or(|selected| name == selected)
++            && include_servers.is_none_or(|included| included.contains(name))
++    });
+     if mcp_servers.is_empty() {
++        if let Some((status_connections, scope)) = retention {
++            status_connections.lock(scope).await.reset().await;
++        }
+         return McpServerStatusSnapshot {
+             server_infos: HashMap::new(),
+             server_capabilities: HashMap::new(),
+@@ -549,40 +653,74 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
+     )
+     .await;
+ 
+-    let server_names = mcp_servers.keys().cloned().collect();
++    let server_names: Vec<String> = mcp_servers.keys().cloned().collect();
+ 
+-    let cancel_token = CancellationToken::new();
++    let mut retained = match retention {
++        Some((status_connections, scope)) => Some(status_connections.lock(scope).await),
++        None => None,
++    };
++    let cancel_token = retained
++        .as_ref()
++        .map_or_else(CancellationToken::new, |set| set.cancel_token.clone());
++    let transient = retained.is_none();
+     let runtime_config = config.for_threadless_operations(&mcp_servers);
+-    let mcp_connection_manager = McpConnectionSet::new(
+-        /*ema_auth*/ None,
+-        /*existing_ema*/ None,
+-        /*previous*/ None,
+-        McpPublicationGate::already_published(),
+-        McpRuntimeInput {
+-            network_policy_metadata: None,
+-            startup_policy: McpStartupPolicy::Eager,
+-            config: Arc::new(runtime_config),
+-            plugins_available: false,
+-            ready_selected_capability_roots: Vec::new(),
+-            mcp_servers,
+-            submit_id: String::new(),
+-            tx_event: None,
+-            startup_cancellation_token: cancel_token.clone(),
+-            runtime_context,
+-            codex_apps_tools_cache,
+-            tool_catalog_cache,
+-            codex_apps_tools_cache_key: connector_runtime_context_key(auth),
+-            client_mcp_extensions: ClientMcpExtensions::default(),
+-            auth: auth.cloned(),
+-            auth_manager: None,
+-            elicitation_reviewer: None,
+-            elicitation_lifecycle: None,
+-        },
+-        crate::elicitation::ElicitationRequestRouter::default(),
+-    )
+-    .await;
++    let mcp_connection_manager = Arc::new(
++        McpConnectionSet::new_for_status(
++            /*ema_auth*/ None,
++            /*existing_ema*/ None,
++            retained.as_ref().and_then(|set| set.connections.as_deref()),
++            McpPublicationGate::already_published(),
++            McpRuntimeInput {
++                network_policy_metadata: None,
++                startup_policy: McpStartupPolicy::Eager,
++                config: Arc::new(runtime_config),
++                plugins_available: false,
++                ready_selected_capability_roots: Vec::new(),
++                mcp_servers,
++                submit_id: String::new(),
++                tx_event: None,
++                startup_cancellation_token: cancel_token.clone(),
++                runtime_context,
++                codex_apps_tools_cache,
++                tool_catalog_cache,
++                codex_apps_tools_cache_key: connector_runtime_context_key(auth),
++                client_mcp_extensions: ClientMcpExtensions::default(),
++                auth: auth.cloned(),
++                auth_manager: None,
++                elicitation_reviewer: None,
++                elicitation_lifecycle: None,
++            },
++            crate::elicitation::ElicitationRequestRouter::default(),
++        )
++        .await,
++    );
++
++    if retained.is_some() {
++        // A new poll can reuse only a ready connection. Finish startup while the
++        // scope lock is held, then let resource and catalog reads run independently.
++        futures::future::join_all(
++            server_names
++                .iter()
++                .map(|name| mcp_connection_manager.wait_for_status_server_startup(name)),
++        )
++        .await;
++    }
++    let previous = retained.as_mut().and_then(|set| {
++        set.touch();
++        set.connections.replace(Arc::clone(&mcp_connection_manager))
++    });
++    let _lease = retained.as_ref().map(|set| set.lease());
++    drop(retained);
++
++    let refresh_errors = if let Some(previous) = previous.as_deref() {
++        mcp_connection_manager
++            .refresh_reused_status_catalogs(previous)
++            .await
++    } else {
++        HashMap::new()
++    };
+ 
+-    let snapshot = collect_mcp_server_status_snapshot_from_manager(
++    let mut snapshot = collect_mcp_server_status_snapshot_from_manager(
+         &mcp_connection_manager,
+         auth_status_entries,
+         server_names,
+@@ -590,7 +728,15 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
+     )
+     .await;
+ 
+-    cancel_token.cancel();
++    for (name, error) in refresh_errors {
++        snapshot.tools_by_server.remove(&name);
++        snapshot.tool_list_meta.remove(&name);
++        snapshot.tools_errors.insert(name, error);
++    }
++
++    if transient {
++        cancel_token.cancel();
++    }
+ 
+     snapshot
+ }
+diff --git a/codex-rs/codex-mcp/src/mcp/status_connections.rs b/codex-rs/codex-mcp/src/mcp/status_connections.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..84adf6f6b0396f79a77d7119798a8b9bf21f4b4c
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/mcp/status_connections.rs
+@@ -0,0 +1,231 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++use std::time::Instant;
++
++use tokio::sync::Mutex;
++use tokio::sync::OwnedMutexGuard;
++use tokio_util::sync::CancellationToken;
++
++use crate::connection_manager::McpConnectionSet;
++
++const STATUS_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
++const STATUS_CONNECTION_REAP_INTERVAL: Duration = Duration::from_secs(30);
++const STATUS_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// A status request may reuse connections only within its own thread and auth origin.
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
++pub enum McpStatusScope {
++    Threadless {
++        auth_originator: String,
++        selected_server: Option<String>,
++    },
++    Thread {
++        thread_id: String,
++        auth_originator: String,
++        selected_server: Option<String>,
++    },
++}
++
++pub(super) struct RetainedStatusSet {
++    pub(super) connections: Option<Arc<McpConnectionSet>>,
++    pub(super) cancel_token: CancellationToken,
++    in_flight: Arc<()>,
++    last_used_at: Instant,
++}
++
++impl RetainedStatusSet {
++    fn new() -> Self {
++        let now = Instant::now();
++        Self {
++            connections: None,
++            cancel_token: CancellationToken::new(),
++            in_flight: Arc::new(()),
++            last_used_at: now,
++        }
++    }
++
++    pub(super) async fn reset(&mut self) {
++        if self
++            .connections
++            .as_ref()
++            .is_some_and(|connections| Arc::strong_count(connections) > 1)
++            || Arc::strong_count(&self.in_flight) > 1
++        {
++            return;
++        }
++        self.stop().await;
++        self.cancel_token = CancellationToken::new();
++        self.last_used_at = Instant::now();
++    }
++
++    async fn stop(&mut self) {
++        self.cancel_token.cancel();
++        if let Some(connections) = self.connections.take()
++            && tokio::time::timeout(STATUS_CONNECTION_SHUTDOWN_TIMEOUT, connections.shutdown())
++                .await
++                .is_err()
++        {
++            tracing::warn!("timed out stopping idle MCP status connections");
++        }
++    }
++
++    pub(super) fn touch(&mut self) {
++        self.last_used_at = Instant::now();
++    }
++
++    pub(super) fn lease(&self) -> Arc<()> {
++        Arc::clone(&self.in_flight)
++    }
++
++    fn should_reap(&self) -> bool {
++        self.last_used_at.elapsed() >= STATUS_CONNECTION_IDLE_TIMEOUT
++            && Arc::strong_count(&self.in_flight) == 1
++            && self
++                .connections
++                .as_ref()
++                .is_none_or(|connections| Arc::strong_count(connections) == 1)
++    }
++}
++
++impl Drop for RetainedStatusSet {
++    fn drop(&mut self) {
++        self.cancel_token.cancel();
++    }
++}
++
++#[derive(Default)]
++struct StatusConnectionsInner {
++    scopes: Mutex<HashMap<McpStatusScope, Arc<Mutex<RetainedStatusSet>>>>,
++    reaper_started: AtomicBool,
++}
++
++impl StatusConnectionsInner {
++    async fn reap_expired(&self) {
++        let expired = {
++            let mut scopes = self.scopes.lock().await;
++            let mut expired = Vec::new();
++            scopes.retain(|_, slot| {
++                // A caller that already selected this slot must finish before it can be removed.
++                if Arc::strong_count(slot) != 1 {
++                    return true;
++                }
++                let should_reap = slot.try_lock().is_ok_and(|status| status.should_reap());
++                if should_reap {
++                    expired.push(Arc::clone(slot));
++                }
++                !should_reap
++            });
++            expired
++        };
++        for slot in expired {
++            slot.lock().await.stop().await;
++        }
++    }
++}
++
++/// Keeps the app server's status connections alive between UI polling requests.
++#[derive(Clone, Default)]
++pub struct McpStatusConnections {
++    inner: Arc<StatusConnectionsInner>,
++}
++
++impl McpStatusConnections {
++    pub(super) async fn lock(&self, scope: McpStatusScope) -> OwnedMutexGuard<RetainedStatusSet> {
++        self.start_reaper();
++        let slot = {
++            let mut scopes = self.inner.scopes.lock().await;
++            Arc::clone(
++                scopes
++                    .entry(scope)
++                    .or_insert_with(|| Arc::new(Mutex::new(RetainedStatusSet::new()))),
++            )
++        };
++        slot.lock_owned().await
++    }
++
++    fn start_reaper(&self) {
++        if self.inner.reaper_started.swap(true, Ordering::AcqRel) {
++            return;
++        }
++        let weak = Arc::downgrade(&self.inner);
++        tokio::spawn(async move {
++            let mut interval = tokio::time::interval(STATUS_CONNECTION_REAP_INTERVAL);
++            loop {
++                interval.tick().await;
++                let Some(inner) = weak.upgrade() else {
++                    break;
++                };
++                inner.reap_expired().await;
++            }
++        });
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn scope(thread_id: &str) -> McpStatusScope {
++        McpStatusScope::Thread {
++            thread_id: thread_id.to_owned(),
++            auth_originator: "test".to_owned(),
++            selected_server: None,
++        }
++    }
++
++    #[tokio::test]
++    async fn status_scopes_serialize_their_own_requests_and_reap_idle_connections() {
++        let connections = McpStatusConnections::default();
++        let first_scope = scope("first");
++        let second_scope = scope("second");
++        let mut first = connections.lock(first_scope.clone()).await;
++        let first_token = first.cancel_token.clone();
++
++        let first_slot = {
++            let scopes = connections.inner.scopes.lock().await;
++            Arc::clone(scopes.get(&first_scope).expect("first scope"))
++        };
++        assert!(first_slot.try_lock().is_err());
++
++        let second = tokio::time::timeout(
++            Duration::from_secs(1),
++            connections.lock(second_scope.clone()),
++        )
++        .await
++        .expect("another thread's status request should not wait");
++        let second_token = second.cancel_token.clone();
++        drop(second);
++
++        let in_flight = first.lease();
++        first.last_used_at = Instant::now() - STATUS_CONNECTION_IDLE_TIMEOUT;
++        drop(first);
++        drop(first_slot);
++        connections.inner.reap_expired().await;
++
++        assert!(!first_token.is_cancelled());
++        drop(in_flight);
++        connections.inner.reap_expired().await;
++
++        assert!(first_token.is_cancelled());
++        assert!(!second_token.is_cancelled());
++        assert!(
++            !connections
++                .inner
++                .scopes
++                .lock()
++                .await
++                .contains_key(&first_scope)
++        );
++        assert!(
++            connections
++                .inner
++                .scopes
++                .lock()
++                .await
++                .contains_key(&second_scope)
++        );
++    }
++}
+diff --git a/codex-rs/codex-mcp/src/runtime/status.rs b/codex-rs/codex-mcp/src/runtime/status.rs
+index c183524d1c4c72ab4a0a556f0291a6c21a161426..c0a002e30f181644429621614e89cc50d52d1044 100644
+--- a/codex-rs/codex-mcp/src/runtime/status.rs
++++ b/codex-rs/codex-mcp/src/runtime/status.rs
+@@ -1,5 +1,6 @@
+-//! Read selected-server metadata from one published thread runtime.
++//! Read matching server metadata from one published thread runtime.
+ 
++use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ use super::McpRuntime;
+@@ -8,6 +9,7 @@ use crate::McpConfig;
+ use crate::McpServerStatusSnapshot;
+ use crate::McpSnapshotDetail;
+ use crate::ResolvedMcpServer;
++use crate::connection_manager::McpConnectionSet;
+ use crate::mcp::collect_mcp_server_status_snapshot_from_manager;
+ use crate::mcp::compute_auth_statuses;
+ use crate::mcp::effective_mcp_servers;
+@@ -22,6 +24,36 @@ impl McpRuntime {
+         detail: McpSnapshotDetail,
+         expected_registration: Option<&ResolvedMcpServer>,
+         runtime_context: &McpRuntimeContext,
++    ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
++        self.status_snapshot(detail, runtime_context, |name, config, _| {
++            name == server
++                && expected_registration
++                    .is_none_or(|expected| config.mcp_server_catalog.server(name) == Some(expected))
++        })
++        .await
++    }
++
++    /// Reads matching registrations from one published runtime without another connection set.
++    pub async fn servers_status_snapshot(
++        &self,
++        expected_registrations: &HashMap<String, ResolvedMcpServer>,
++        detail: McpSnapshotDetail,
++        runtime_context: &McpRuntimeContext,
++    ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
++        self.status_snapshot(detail, runtime_context, |name, config, connections| {
++            connections.contains_server(name)
++                && expected_registrations.get(name).is_some_and(|expected| {
++                    config.mcp_server_catalog.server(name) == Some(expected)
++                })
++        })
++        .await
++    }
++
++    async fn status_snapshot(
++        &self,
++        detail: McpSnapshotDetail,
++        runtime_context: &McpRuntimeContext,
++        matches_registration: impl Fn(&str, &McpConfig, &McpConnectionSet) -> bool,
+     ) -> anyhow::Result<(Arc<McpConfig>, McpServerStatusSnapshot)> {
+         let current = self.current.load_full();
+         let runtime_context = runtime_context.clone().with_selected_environments(
+@@ -35,20 +67,16 @@ impl McpRuntime {
+                 .ok_or_else(|| anyhow::anyhow!("MCP runtime is not configured"))?,
+         );
+         let mut servers = effective_mcp_servers(&config, current.auth.as_ref());
+-        servers.retain(|name, _| {
+-            name == server
+-                && expected_registration
+-                    .is_none_or(|expected| config.mcp_server_catalog.server(name) == Some(expected))
+-        });
++        servers.retain(|name, _| matches_registration(name, &config, &current.connections));
+         if config.xaa_enabled
+             && servers
+                 .values()
+                 .any(|server| matches!(server.config().auth, codex_config::McpServerAuth::EmaAuth))
+         {
+-            // Finish selected startup and any rejected-grant cleanup before reading auth.
++            // Finish matching startup and any rejected-grant cleanup before reading auth.
+             current
+                 .connections
+-                .list_available_server_infos(|name| name == server)
++                .list_available_server_infos(|name| servers.contains_key(name))
+                 .await;
+         }
+         let auth_statuses = compute_auth_statuses(
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+index 024eb76132c1b5340c2d1696204be2a7add60245..def7460a8abcafc6294c5cab91684137c07becc6 100644
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -1183,6 +1183,24 @@ impl CodexThread {
+             .await
+     }
+ 
++    /// Reads all matching servers from this thread's published MCP runtime.
++    pub async fn mcp_servers_status_snapshot(
++        &self,
++        expected_registrations: &std::collections::HashMap<String, codex_mcp::ResolvedMcpServer>,
++        detail: codex_mcp::McpSnapshotDetail,
++    ) -> anyhow::Result<(
++        Arc<codex_mcp::McpConfig>,
++        codex_mcp::McpServerStatusSnapshot,
++    )> {
++        self.session.refresh_mcp_if_dirty().await;
++        let runtime_context = self.session.current_mcp_runtime_context().await;
++        self.session
++            .services
++            .mcp_runtime
++            .servers_status_snapshot(expected_registrations, detail, &runtime_context)
++            .await
++    }
++
+     /// Reads an app resource using the current authority of its originating tool call.
+     pub async fn read_mcp_resource_for_call(
+         &self,
+diff --git a/codex-rs/core/src/mcp.rs b/codex-rs/core/src/mcp.rs
+index f4170cb011aaa9fc6b65ccbc6725eb92ab18a37e..85a86b091f25ba06b761e4ed631d4797ca347c95 100644
+--- a/codex-rs/core/src/mcp.rs
++++ b/codex-rs/core/src/mcp.rs
+@@ -30,6 +30,7 @@ use codex_mcp::McpConfig;
+ use codex_mcp::McpEnvironmentAuthority;
+ use codex_mcp::McpPluginAttribution;
+ use codex_mcp::McpServerRegistration;
++use codex_mcp::McpStatusConnections;
+ use codex_mcp::McpToolCatalogCache;
+ use codex_mcp::ToolInfo;
+ use codex_mcp::codex_apps_mcp_server_config;
+@@ -115,6 +116,7 @@ pub struct McpManager {
+     extensions: Arc<ExtensionRegistry<Config>>,
+     codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
+     tool_catalog_cache: McpToolCatalogCache,
++    status_connections: McpStatusConnections,
+     shared_definitions: Arc<SharedMcpDefinitions>,
+     ema_state: Arc<codex_mcp::EmaState>,
+ }
+@@ -139,6 +141,7 @@ impl McpManager {
+             extensions,
+             codex_apps_tools_cache,
+             tool_catalog_cache: McpToolCatalogCache::default(),
++            status_connections: McpStatusConnections::default(),
+             shared_definitions: Arc::new(SharedMcpDefinitions::default()),
+             ema_state: Arc::default(),
+         }
+@@ -152,6 +155,10 @@ impl McpManager {
+         self.tool_catalog_cache.clone()
+     }
+ 
++    pub fn status_connections(&self) -> McpStatusConnections {
++        self.status_connections.clone()
++    }
++
+     pub(crate) fn shared_definitions(&self) -> &SharedMcpDefinitions {
+         &self.shared_definitions
+     }
