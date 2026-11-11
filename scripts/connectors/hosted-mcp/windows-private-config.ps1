@@ -1,5 +1,6 @@
 param([Parameter(Mandatory=$true)][ValidateSet('protect','verify')][string]$Operation)
 $ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 $path = [Console]::In.ReadToEnd()
 $item = Get-Item -LiteralPath $path -Force
 if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
