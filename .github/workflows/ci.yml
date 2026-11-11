@@ -8,10 +8,6 @@ permissions:
 jobs:
   verify:
     runs-on: windows-latest
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,8 +15,16 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+      - name: Run tests with a stable runner temp directory
+        shell: pwsh
         env: {OMNICODEX_REAL_RUNTIME_E2E: '0'}
+        run: |
+          if (-not $env:RUNNER_TEMP) { throw 'RUNNER_TEMP is missing' }
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $env:TMPDIR = $env:RUNNER_TEMP
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: npm run build
       - run: npm pack --dry-run --json
       - run: npm audit --omit=dev --audit-level=high
