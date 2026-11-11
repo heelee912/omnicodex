@@ -23,7 +23,7 @@ jobs:
           $env:TEMP = $env:RUNNER_TEMP
           $env:TMP = $env:RUNNER_TEMP
           $env:TMPDIR = $env:RUNNER_TEMP
-          npm test -- --maxWorkers=2
+          npm test -- --maxWorkers=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: npm run build
       - run: npm pack --dry-run --json
