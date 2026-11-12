@@ -1381,6 +1381,11 @@ export class BrowserNativeExecutor {
     }
     const errors: Error[] = [];
     for (const release of releases.values()) {
+      if (boundary?.signal?.aborted === true) {
+        errors.push(browserAbortReason(boundary.signal));
+        break;
+      }
+      let releaseStage: "rebind" | "Stop" = "rebind";
       try {
         // A replacement Node REPL has no first-party turn tracker yet. Rebind
         // only this exact synthetic session with read-only browser requests
@@ -1405,6 +1410,10 @@ export class BrowserNativeExecutor {
         // Current Browser Use releases replaced the rollout watcher with the
         // first-party node_repl Stop hook. Dispatch it under the exact native
         // session and turn so browser-service can detach that session's tabs.
+        // Do not start a Stop hook after the caller's deadline. Its effects
+        // would otherwise be unknowable to the caller and another session.
+        releaseStage = "Stop";
+        throwIfBrowserCallAborted(boundary?.signal);
         const result = await waitForBrowserBoundary(
           this.#nativeExecutor.callInContext(
             "node_repl",
@@ -1433,12 +1442,19 @@ export class BrowserNativeExecutor {
           }
         }
       } catch (error) {
-        errors.push(toError(error));
+        errors.push(
+          new Error(`Native browser ${releaseStage} failed: ${toError(error).message}`, {
+            cause: error,
+          }),
+        );
       }
     }
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
-      throw new AggregateError(errors, "OmniCodex native browser sessions did not release cleanly");
+      throw new AggregateError(
+        errors,
+        `OmniCodex native browser sessions did not release cleanly (first: ${errors[0]?.message})`,
+      );
     }
   }
 
@@ -1593,9 +1609,18 @@ function createBrowserCallBoundary(
   };
 }
 
-function waitForBrowserBoundary<T>(completion: Promise<T>, signal?: AbortSignal): Promise<T> {
+/** @internal Keep late native rejections observed after a caller deadline. */
+export function waitForBrowserBoundary<T>(
+  completion: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   if (signal === undefined) return completion;
-  if (signal.aborted) return Promise.reject(browserAbortReason(signal));
+  if (signal.aborted) {
+    // The caller may have created an already-rejected native Promise before
+    // entering this boundary. Observe it even though this wait cannot start.
+    void completion.catch(() => undefined);
+    return Promise.reject(browserAbortReason(signal));
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const finish = (action: () => void) => {

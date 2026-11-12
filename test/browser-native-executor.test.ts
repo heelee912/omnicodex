@@ -8,6 +8,7 @@ import {
   type BrowserNativeContextRequest,
   type BrowserNativeExecutionStage,
   BrowserNativeExecutor,
+  waitForBrowserBoundary,
 } from "../src/application/browser-native-executor.js";
 import { structuredErrorDetails } from "../src/infrastructure/runtime/structured-error-details.js";
 
@@ -1673,6 +1674,59 @@ describe("BrowserNativeExecutor", () => {
     await second.close({ preserveActivities: true });
   });
 
+  it("does not start another native release after restored cleanup reaches its deadline", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omnicodex-browser-release-deadline-"));
+    const clientPath = await installBrowserClient(root, "1.0.0");
+    await writeFile(
+      join(clientPath, "..", "browser-service.mjs"),
+      "export const browserServiceVersion = 'tracker-removed';",
+      "utf8",
+    );
+    const calls: Array<{ tool: string; code: string }> = [];
+    let holdRebind = false;
+    const createExecutor = () =>
+      new BrowserNativeExecutor(
+        {
+          callInContext: async (_server, tool, args, _thread, _progress, _turnId, signal) => {
+            const code = String((args as { code?: string }).code ?? "");
+            calls.push({ tool, code });
+            if (holdRebind && tool === "js" && code.includes("await browser.tabs.list()")) {
+              if (signal === undefined) throw new Error("Missing browser deadline signal");
+              return await new Promise<never>((_resolve, reject) => {
+                if (signal.aborted) return reject(signal.reason);
+                signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+              });
+            }
+            return { ok: true };
+          },
+        },
+        { codexHome: root, resolveContextThreadId: async () => "browser-host" },
+      );
+    const context = { ownerBinding: "owner", workSessionBinding: "work" };
+    const first = createExecutor();
+    for (const contextTurnId of ["old-one", "old-two"]) {
+      await first.call(
+        { operation: "inspect", surface: "chrome", target_tab_id: "tab-1" },
+        { ...context, contextTurnId },
+      );
+    }
+    await first.close({ preserveActivities: true });
+    calls.length = 0;
+    holdRebind = true;
+    const replacement = createExecutor();
+    await expect(
+      replacement.call(
+        { operation: "inspect", surface: "chrome", target_tab_id: "tab-1", timeout_ms: 500 },
+        context,
+      ),
+    ).rejects.toThrow(
+      /OmniCodex native browser sessions did not release cleanly \(first: Native browser rebind failed: Browser call deadline exceeded/,
+    );
+    expect(calls.filter(({ code }) => code.includes("await browser.tabs.list()"))).toHaveLength(1);
+    expect(calls.filter(({ tool }) => tool === "turn_ended")).toHaveLength(0);
+    await replacement.close({ preserveActivities: true });
+  });
+
   it("adopts a durable browser activity after service replacement without completing or replaying it", async () => {
     const root = await mkdtemp(join(tmpdir(), "omnicodex-browser-service-replacement-"));
     const lifecycleRoot = join(root, "browser-lifecycles");
@@ -2776,6 +2830,23 @@ describe("BrowserNativeExecutor", () => {
     await expect(executor.call({ operation: "list_surfaces", timeout_ms: 20 })).rejects.toThrow(
       "Browser call deadline exceeded",
     );
+  });
+
+  it("observes a native rejection when the browser deadline was already reached", async () => {
+    const deadline = new Error("Browser call deadline exceeded");
+    const controller = new AbortController();
+    controller.abort(deadline);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const native = Promise.reject(new Error("late native rejection"));
+      await expect(waitForBrowserBoundary(native, controller.signal)).rejects.toBe(deadline);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   it("propagates the caller boundary through context discovery and preserves the remaining deadline for dispatch", async () => {
