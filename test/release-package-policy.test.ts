@@ -61,7 +61,10 @@ describe("release package policy", () => {
     expect(JSON.stringify(pkg.files)).not.toMatch(/(?:__pycache__|\.pyc|history|ISSUE_LOG)/i);
   });
   it("excludes generated Python bytecode from the bundled desktop engine", async () => {
-    const ignore = await readFile(new URL("scripts/windows/desktop-engine/.npmignore", root), "utf8");
+    const ignore = await readFile(
+      new URL("scripts/windows/desktop-engine/.npmignore", root),
+      "utf8",
+    );
     expect(ignore.split(/\r?\n/u)).toEqual(expect.arrayContaining(["__pycache__/", "*.pyc"]));
   });
   it("ships only portable hosted connector runtime, never account state", async () => {
