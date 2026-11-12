@@ -22,6 +22,7 @@ describe("release package policy", () => {
       "docs/README.ja.md",
       "docs/README.zh.md",
       "docs/reference-ledger.md",
+      "docs/windows-cua-document-role-repair.md",
       "scripts/connectors/hosted-mcp/config.mjs",
       "scripts/connectors/hosted-mcp/config-store.mjs",
       "scripts/connectors/hosted-mcp/setup.mjs",
@@ -58,6 +59,10 @@ describe("release package policy", () => {
     expect(pkg.files).not.toContain("docs");
     expect(pkg.files).not.toContain("scripts/oracle");
     expect(JSON.stringify(pkg.files)).not.toMatch(/(?:__pycache__|\.pyc|history|ISSUE_LOG)/i);
+  });
+  it("excludes generated Python bytecode from the bundled desktop engine", async () => {
+    const ignore = await readFile(new URL("scripts/windows/desktop-engine/.npmignore", root), "utf8");
+    expect(ignore.split(/\r?\n/u)).toEqual(expect.arrayContaining(["__pycache__/", "*.pyc"]));
   });
   it("ships only portable hosted connector runtime, never account state", async () => {
     const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8")) as {

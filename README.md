@@ -51,6 +51,11 @@ Desktop runtime, and Rust (`rustc.exe` in the current user's `.cargo/bin`) when
 the Desktop bridge must be installed or rebuilt. The npm package contains the
 launcher source, not a prebuilt `.exe`.
 
+Affected Windows CUA runtimes can be inspected with the optional
+[document-role repair guide](docs/windows-cua-document-role-repair.md). This
+source-only addition is **not** in the existing `v0.1.0` Release tarball; it
+does not patch a running Desktop or disable browser URL safety checks.
+
 Run these steps in order. Replace every example value; the issuer, audience,
 resource, owner subject, and public origin are exact security identities.
 No Auth0 tenant, owner subject, OAuth credential, tunnel token, private key,

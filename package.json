@@ -22,6 +22,7 @@
     "docs/README.ja.md",
     "docs/README.zh.md",
     "docs/reference-ledger.md",
+    "docs/windows-cua-document-role-repair.md",
     "scripts/connectors/hosted-mcp/config.mjs",
     "scripts/connectors/hosted-mcp/config-store.mjs",
     "scripts/connectors/hosted-mcp/setup.mjs",

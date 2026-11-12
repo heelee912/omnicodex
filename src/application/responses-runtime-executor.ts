@@ -1120,7 +1120,12 @@ export class ResponsesRuntimeExecutor {
   }
 
   #enqueue<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted === true) return Promise.reject(abortError(signal));
+    let started = false;
+    let onAbort: (() => void) | undefined;
     const guarded = () => {
+      started = true;
+      if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
       throwIfAborted(signal);
       if (this.#processFailure !== undefined) throw this.#processFailure;
       return operation();
@@ -1130,7 +1135,29 @@ export class ResponsesRuntimeExecutor {
       () => undefined,
       () => undefined,
     );
-    return run;
+    if (signal === undefined) return run;
+    // Only a queued caller may leave early. Once dispatched, retain the native
+    // terminal wait and serialization even if the caller aborts.
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      onAbort = () => {
+        if (started || settled) return;
+        settled = true;
+        reject(abortError(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      void run.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort as () => void);
+          if (!settled) resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort as () => void);
+          if (!settled) reject(error);
+        },
+      );
+    });
   }
 }
 

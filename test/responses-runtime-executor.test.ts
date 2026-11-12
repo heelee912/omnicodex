@@ -1294,6 +1294,63 @@ describe("ResponsesRuntimeExecutor primary-process binding", () => {
     expect(executor.executionSignal("ephemeral-model-free-thread")).toBeUndefined();
   });
 
+  it("cancels an undispatched queued call without interrupting the active turn or another executor", async () => {
+    const executor = new ResponsesRuntimeExecutor({
+      turnTimeoutMs: 5_000,
+      codeCellLifecycle: successfulCodeCellLifecycle,
+    });
+    executors.push(executor);
+    const binding = await executor.prepare();
+    const runtime = fakeRuntime(binding);
+    await executor.start(runtime.process);
+    runtime.holdNextTurn();
+
+    const activeController = new AbortController();
+    const active = executor.call(
+      { kind: "custom", namespace: "functions", name: "exec", arguments: 'text("held")' },
+      activeController.signal,
+    );
+    await runtime.waitForHeldTurn();
+    const turnCount = runtime.requests.filter((request) => request.method === "turn/start").length;
+
+    const queuedController = new AbortController();
+    const queued = executor.callNested(
+      "exec_command",
+      { cmd: "queued and cancelled" },
+      false,
+      queuedController.signal,
+    );
+    queuedController.abort(new Error("queued call cancelled"));
+    await expect(queued).rejects.toThrow("queued call cancelled");
+    expect(runtime.requests.filter((request) => request.method === "turn/start")).toHaveLength(
+      turnCount,
+    );
+
+    const independent = new ResponsesRuntimeExecutor({
+      codeCellLifecycle: successfulCodeCellLifecycle,
+    });
+    executors.push(independent);
+    const peerBinding = await independent.prepare();
+    const peerRuntime = fakeRuntime(peerBinding);
+    await independent.start(peerRuntime.process);
+    await expect(
+      independent.callNested("exec_command", { cmd: "independent session" }, false),
+    ).resolves.toBeDefined();
+    expect(peerRuntime.requests.some((request) => request.method === "turn/start")).toBe(true);
+
+    activeController.abort(new Error("active turn interrupted"));
+    await runtime.waitForInterrupt();
+    runtime.releaseInterruptedTurn();
+    await expect(active).rejects.toThrow("active turn interrupted");
+    expect(runtime.requests.filter((request) => request.method === "turn/start")).toHaveLength(
+      turnCount,
+    );
+    await executor.callNested("exec_command", { cmd: "after terminal state" }, false);
+    expect(runtime.requests.filter((request) => request.method === "turn/start")).toHaveLength(
+      turnCount + 1,
+    );
+  });
+
   it("hard-stops only the attached owned App Server when the default terminal grace expires", async () => {
     const executor = new ResponsesRuntimeExecutor({
       turnTimeoutMs: 5_000,
