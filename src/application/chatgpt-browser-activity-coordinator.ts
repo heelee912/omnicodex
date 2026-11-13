@@ -63,6 +63,8 @@ interface BrowserActivityRecord {
   idleObservations: number;
   lastObserved: number;
   retiring?: boolean;
+  stopAttempts?: number;
+  stopCleanupEntered?: boolean;
   restorePending?: boolean;
   drain?: Promise<void>;
   resolveDrain?: () => void;
@@ -111,6 +113,7 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
           code: "BROWSER_ACTIVITY_CONVERSATION_MISMATCH",
         });
       }
+      if (record.retiring === true) return;
       record.conversationId = conversationId;
       record.revision += 1;
       record.idleObservations = 0;
@@ -266,6 +269,7 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
           idleObservations: 0,
           lastObserved: 0,
           retiring: true,
+          stopAttempts: 1,
           restorePending: true,
         };
         this.#records.set(key, restored);
@@ -279,6 +283,8 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
         throw new Error("BROWSER_ACTIVITY_CONVERSATION_MISMATCH");
       }
       current.retiring = true;
+      current.stopAttempts = (current.stopAttempts ?? 0) + 1;
+      current.revision += 1;
       if (current.callsInFlight > 0 && current.drain === undefined) {
         current.drain = new Promise<void>((resolve) => {
           current.resolveDrain = resolve;
@@ -286,10 +292,48 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
       }
       return current;
     });
-    await record.drain;
-    // Reserve native scheduler resources only after admitted calls settle.
-    // A queued call may hold an activity reservation while awaiting that same lock.
-    await scheduleCleanup(() => this.#enqueue(key, () => this.#retireRecord(record)));
+    this.#scheduleObservation();
+    let cleanup: Promise<void> | undefined;
+    let cleanupAdmissionClosed = false;
+    try {
+      await record.drain;
+      // Reserve native resources only after admitted calls settle. The
+      // scheduler may reject an early waiter while its physical promise drains.
+      await scheduleCleanup(() => {
+        if (cleanup !== undefined) return cleanup;
+        if (cleanupAdmissionClosed)
+          return Promise.reject(new Error("BROWSER_ACTIVITY_STOP_CLEANUP_CANCELLED"));
+        record.stopCleanupEntered = true;
+        cleanup = this.#enqueue(key, () => this.#retireRecord(record));
+        return cleanup;
+      });
+      if (cleanup === undefined) throw new Error("BROWSER_ACTIVITY_STOP_CLEANUP_NOT_ENTERED");
+      await cleanup;
+    } finally {
+      // Close late callback admission before rollback: a cancelled scheduler
+      // waiter must never start native cleanup after this record is re-opened.
+      cleanupAdmissionClosed = true;
+      record.stopAttempts = (record.stopAttempts ?? 1) - 1;
+      if (record.stopAttempts === 0 && record.stopCleanupEntered !== true) {
+        await this.#enqueue(key, async () => {
+          if (
+            this.#records.get(key) !== record ||
+            record.stopAttempts !== 0 ||
+            record.stopCleanupEntered === true
+          )
+            return;
+          if (record.restorePending === true) this.#records.delete(key);
+          else {
+            record.retiring = false;
+            delete record.drain;
+            delete record.resolveDrain;
+            record.idleObservations = 0;
+            record.revision += 1;
+          }
+        });
+      }
+      this.#scheduleObservation();
+    }
   }
 
   async close(options: { readonly preserveActivities?: boolean } = {}): Promise<void> {
@@ -341,11 +385,15 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
   #scheduleObservation(): void {
     if (
       this.#closed ||
-      this.#observationTimer !== undefined ||
-      this.#observationFlight !== undefined ||
-      ![...this.#records.values()].some((record) => record.conversationId !== undefined)
-    )
+      ![...this.#records.values()].some(
+        (record) => record.conversationId !== undefined && record.retiring !== true,
+      )
+    ) {
+      if (this.#observationTimer !== undefined) clearTimeout(this.#observationTimer);
+      this.#observationTimer = undefined;
       return;
+    }
+    if (this.#observationTimer !== undefined || this.#observationFlight !== undefined) return;
     const delay = Math.min(
       (this.#options.observationIntervalMs ?? 30_000) * 2 ** this.#observationFailures,
       300_000,
@@ -363,7 +411,12 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
 
   async #observeCompletion(): Promise<void> {
     const candidates = [...this.#records.values()]
-      .filter((record) => record.conversationId !== undefined && record.callsInFlight === 0)
+      .filter(
+        (record) =>
+          record.conversationId !== undefined &&
+          record.callsInFlight === 0 &&
+          record.retiring !== true,
+      )
       .sort((left, right) => left.lastObserved - right.lastObserved)
       .slice(0, 8)
       .map((record) => ({ record, revision: record.revision }));
@@ -391,7 +444,8 @@ export class ChatGptBrowserActivityCoordinator implements BrowserActivityLifecyc
       // Serial settlement keeps cleanup hooks bounded as well as observations.
       for (const { record, revision } of candidates) {
         await this.#enqueue(record.key, async () => {
-          if (this.#closed || this.#records.get(record.key) !== record) return;
+          if (this.#closed || this.#records.get(record.key) !== record || record.retiring === true)
+            return;
           record.lastObserved = ++this.#observationSequence;
           if (record.revision !== revision || record.callsInFlight !== 0) return;
           const id = record.conversationId;

@@ -29,6 +29,221 @@ function fixture() {
 }
 
 describe("ChatGptBrowserActivityCoordinator conversation lifetime", () => {
+  it("never automatically observes or retries a retiring failed Stop", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    try {
+      const original = await f.coordinator.coordinate(f, context);
+      f.finishActivity.mockRejectedValueOnce(new Error("unknown Stop outcome"));
+      await expect(f.coordinator.finishCurrentActivity(f, context)).rejects.toThrow("unknown Stop");
+      await f.coordinator.observeActivityBoundary(context);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(f.read).not.toHaveBeenCalled();
+      expect(f.finishActivity).toHaveBeenCalledOnce();
+      // Other owner/Work records remain observable without reviving this Stop.
+      const otherContext = {
+        ...context,
+        ownerBinding: "other-owner",
+        workSessionBinding: "other-work",
+        chatGptConversationId: B,
+      };
+      const other = await f.coordinator.coordinate(f, otherContext);
+      f.read.mockResolvedValue([]);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(f.read).toHaveBeenCalledWith(expect.any(AbortSignal), [B]);
+      expect(f.finishActivity.mock.calls.map(([binding]) => binding)).toEqual([
+        original.activityBinding,
+        other.activityBinding,
+      ]);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(f.coordinator.coordinate(f, context)).rejects.toThrow(
+        "BROWSER_ACTIVITY_RETIRING",
+      );
+      await f.coordinator.finishCurrentActivity(f, context);
+      expect(f.finishActivity.mock.calls.at(-1)?.[0]).toBe(original.activityBinding);
+    } finally {
+      await f.coordinator.close({ preserveActivities: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores an idle observation already in flight when Stop begins retiring", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    let finishRead!: (ids: readonly string[]) => void;
+    try {
+      await f.coordinator.coordinate(f, context);
+      f.read.mockResolvedValueOnce([]);
+      await vi.advanceTimersByTimeAsync(5);
+      f.read.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishRead = resolve;
+          }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      expect(f.read).toHaveBeenCalledTimes(2);
+      f.finishActivity.mockRejectedValueOnce(new Error("unknown Stop outcome"));
+      await expect(f.coordinator.finishCurrentActivity(f, context)).rejects.toThrow("unknown Stop");
+      finishRead([]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(f.finishActivity).toHaveBeenCalledOnce();
+      expect(f.read).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(f.coordinator.coordinate(f, context)).rejects.toThrow(
+        "BROWSER_ACTIVITY_RETIRING",
+      );
+    } finally {
+      finishRead?.([]);
+      await f.coordinator.close({ preserveActivities: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])(
+    "rolls back proven pre-dispatch cancellation (restored=%s)",
+    async (restored) => {
+      const f = fixture();
+      const executor = { ...f, finishCurrentActivity: vi.fn(async () => undefined) };
+      const scheduler = new NativeExecutionScheduler();
+      const controller = new AbortController();
+      controller.abort();
+      try {
+        const original = restored ? undefined : await f.coordinator.coordinate(executor, context);
+        await expect(
+          f.coordinator.finishCurrentActivity(executor, context, (cleanup) =>
+            scheduler.run(
+              {
+                ownerId: "owner-a",
+                sessionId: "work-a",
+                signal: controller.signal,
+                entry: {
+                  nativeNamespace: "omnicodex",
+                  originalName: "browser_activity_stop",
+                  source: "omnicodex",
+                  stateEffect: "mutate",
+                },
+              },
+              cleanup,
+            ),
+          ),
+        ).rejects.toThrow();
+        expect(f.finishActivity).not.toHaveBeenCalled();
+        expect(executor.finishCurrentActivity).not.toHaveBeenCalled();
+        const next = await f.coordinator.coordinate(executor, context);
+        if (original !== undefined) expect(next.activityBinding).toBe(original.activityBinding);
+        await f.coordinator.finishCurrentActivity(executor, context);
+        expect(f.finishActivity).toHaveBeenCalledOnce();
+      } finally {
+        await f.coordinator.close({ preserveActivities: true });
+        await scheduler.shutdown();
+      }
+    },
+  );
+
+  it("rejects a late cleanup callback after a cancelled schedule rolled back", async () => {
+    const f = fixture();
+    let lateCleanup!: () => Promise<void>;
+    try {
+      const original = await f.coordinator.coordinate(f, context);
+      await expect(
+        f.coordinator.finishCurrentActivity(f, context, async (cleanup) => {
+          lateCleanup = cleanup;
+          throw new Error("cancelled before cleanup");
+        }),
+      ).rejects.toThrow("cancelled before cleanup");
+      expect((await f.coordinator.coordinate(f, context)).activityBinding).toBe(
+        original.activityBinding,
+      );
+      await expect(lateCleanup()).rejects.toThrow("BROWSER_ACTIVITY_STOP_CLEANUP_CANCELLED");
+      expect(f.finishActivity).not.toHaveBeenCalled();
+    } finally {
+      await f.coordinator.close({ preserveActivities: true });
+    }
+  });
+
+  it("does not reopen a record until every never-entered concurrent Stop has cancelled", async () => {
+    const f = fixture();
+    const rejectors: ((error: Error) => void)[] = [];
+    const schedule = async () =>
+      new Promise<void>((_resolve, reject) => {
+        rejectors.push(reject);
+      });
+    try {
+      const original = await f.coordinator.coordinate(f, context);
+      const first = expect(
+        f.coordinator.finishCurrentActivity(f, context, schedule),
+      ).rejects.toThrow("cancelled");
+      const second = expect(
+        f.coordinator.finishCurrentActivity(f, context, schedule),
+      ).rejects.toThrow("cancelled");
+      await vi.waitFor(() => expect(rejectors).toHaveLength(2));
+      rejectors[0]?.(new Error("cancelled"));
+      await first;
+      await expect(f.coordinator.coordinate(f, context)).rejects.toThrow(
+        "BROWSER_ACTIVITY_RETIRING",
+      );
+      rejectors[1]?.(new Error("cancelled"));
+      await second;
+      expect((await f.coordinator.coordinate(f, context)).activityBinding).toBe(
+        original.activityBinding,
+      );
+      expect(f.finishActivity).not.toHaveBeenCalled();
+    } finally {
+      for (const reject of rejectors) reject(new Error("cancelled"));
+      await f.coordinator.close({ preserveActivities: true });
+    }
+  });
+
+  it("retains retirement on cancellation after cleanup entered and on a later pre-dispatch failure", async () => {
+    const f = fixture();
+    let entered!: () => void;
+    let failCleanup!: (error: Error) => void;
+    const nativeEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const native = new Promise<void>((_resolve, reject) => {
+      failCleanup = reject;
+    });
+    f.finishActivity.mockImplementationOnce(async () => {
+      entered();
+      await native;
+    });
+    try {
+      const original = await f.coordinator.coordinate(f, context);
+      await expect(
+        f.coordinator.finishCurrentActivity(f, context, async (cleanup) => {
+          void cleanup().catch(() => undefined);
+          await nativeEntered;
+          throw new Error("cancelled after entry");
+        }),
+      ).rejects.toThrow("cancelled after entry");
+      await expect(f.coordinator.coordinate(f, context)).rejects.toThrow(
+        "BROWSER_ACTIVITY_RETIRING",
+      );
+      failCleanup(new Error("native outcome unknown"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(
+        f.coordinator.finishCurrentActivity(f, context, async () => {
+          throw new Error("cancelled retry");
+        }),
+      ).rejects.toThrow("cancelled retry");
+      await expect(f.coordinator.coordinate(f, context)).rejects.toThrow(
+        "BROWSER_ACTIVITY_RETIRING",
+      );
+      expect(f.finishActivity).toHaveBeenCalledOnce();
+      await f.coordinator.finishCurrentActivity(f, context);
+      expect(f.finishActivity.mock.calls.map(([binding]) => binding)).toEqual([
+        original.activityBinding,
+        original.activityBinding,
+      ]);
+    } finally {
+      failCleanup(new Error("native outcome unknown"));
+      await f.coordinator.close({ preserveActivities: true });
+    }
+  });
+
   it("does not deadlock restored Stop against CodeMode holding a lane before activity registration", async () => {
     const f = fixture();
     const scheduler = new NativeExecutionScheduler();

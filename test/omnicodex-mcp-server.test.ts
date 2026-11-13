@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { type Tool, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Ajv } from "ajv";
 import { describe, expect, it, vi } from "vitest";
 import { AppServerMethodCatalog } from "../src/application/app-server-method-catalog.js";
+import type { BrowserNativeCallContext } from "../src/application/browser-native-executor.js";
 import { ChatAccountRateLimitError } from "../src/application/chat-account-request-coordinator.js";
+import { ChatGptBrowserActivityCoordinator } from "../src/application/chatgpt-browser-activity-coordinator.js";
 import { CodexAppHostToolExecutor } from "../src/application/codex-app-host-tool-executor.js";
 import { ComputerUseNativeResponseError } from "../src/application/computer-use-native-executor.js";
 import {
@@ -50,6 +55,7 @@ import {
   OMNICODEX_FULL_CATALOG_PAGE_BYTE_BUDGET,
   OMNICODEX_FULL_CATALOG_PRIORITY,
   OMNICODEX_NATIVE_SEARCH_PAGE_BYTE_BUDGET,
+  type OmniCodexMcpServerOptions,
   OmniCodexNativeToolRegistryCatalog,
 } from "../src/infrastructure/mcp/omnicodex-mcp-server.js";
 import { ReadInvocationCoordinator } from "../src/infrastructure/mcp/read-invocation-coordinator.js";
@@ -66,6 +72,698 @@ const ALL_FALSE_ANNOTATIONS = {
 } as const;
 
 describe("OmniCodex MCP server", () => {
+  describe("bounded Browser activity Stop", () => {
+    const toolName = "codex__omnicodex__browser_activity_stop";
+    const ownerBinding = "stop-owner";
+    const workSessionBinding = "stop-work";
+    const activityContext: BrowserNativeCallContext = {
+      ownerBinding,
+      workSessionBinding,
+      callerProvenance: "chatgpt_conversation",
+    };
+    const workSession = (binding = workSessionBinding) => ({
+      workSessionBinding: binding,
+      directGoalClaimantBinding: "stop-claimant",
+      directJobOwnerBinding: "stop-job-owner",
+      continuationToken: "stop-continuation",
+      journalCursor: "stop-journal",
+    });
+    const stopRequest = (invocationId?: string) => ({
+      name: toolName,
+      arguments: {},
+      ...(invocationId === undefined ? {} : { _meta: { "omnicodex/invocationId": invocationId } }),
+    });
+    const gate = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const connect = async (
+      overrides: Partial<OmniCodexMcpServerOptions> = {},
+      omitted: readonly (keyof OmniCodexMcpServerOptions)[] = [],
+    ) => {
+      const coordinator = new ChatGptBrowserActivityCoordinator({
+        readActiveConversationIds: async () => ({
+          activeConversationIds: [],
+          unknownConversationIds: [],
+        }),
+        observationIntervalMs: 300_000,
+      });
+      const executor = {
+        call: vi.fn(async () => ({ content: [] })),
+        beginActivity: vi.fn(async (_binding: string, _context?: BrowserNativeCallContext) => {}),
+        finishActivity: vi.fn(async (_binding: string, _context?: BrowserNativeCallContext) => {}),
+        finishCurrentActivity: vi.fn(async (_context?: BrowserNativeCallContext) => {}),
+      };
+      const scheduler = new RecordingNativeExecutionScheduler();
+      const observations: NativeToolExecutionObservation[] = [];
+      const mutations: McpMutationReplayObservation[] = [];
+      const mutationReplayStore = MutationReplayStore.inMemory();
+      const legacyMutationCoordinator = LegacyMutationCoordinator.inMemory();
+      const serverOptions: OmniCodexMcpServerOptions = {
+        appServer: {
+          request: async <T>(method: string): Promise<T> => {
+            if (method === "mcpServerStatus/list") return { data: [], nextCursor: null } as T;
+            throw new Error(`Unexpected Stop fixture request: ${method}`);
+          },
+        },
+        authorizationBinding: ownerBinding,
+        mutationReplayStore,
+        legacyMutationCoordinator,
+        browserNativeExecutor: executor,
+        browserActivityCoordinator: coordinator,
+        scheduler,
+        resolveDurableWorkSessionBinding: () => workSession(),
+        observeNativeToolExecution: (event) => {
+          observations.push(event);
+        },
+        observeMutationReplay: (event) => {
+          mutations.push(event);
+        },
+        ...overrides,
+      };
+      for (const key of omitted) Reflect.deleteProperty(serverOptions, key);
+      const handle = createOmniCodexMcpServer(serverOptions);
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "bounded-browser-stop-fixture", version: "1" });
+      await handle.server.connect(serverTransport);
+      await client.connect(clientTransport);
+      return {
+        client,
+        handle,
+        coordinator,
+        executor,
+        scheduler,
+        observations,
+        mutations,
+        mutationReplayStore,
+        legacyMutationCoordinator,
+        close: async () => {
+          await client.close();
+          await handle.server.close();
+          await coordinator.close({ preserveActivities: true });
+        },
+      };
+    };
+
+    it.each([
+      ["full", false],
+      ["compat", false],
+      ["full", true],
+      ["compat", true],
+    ] as const)(
+      "advertises the empty non-model Stop in %s catalog/search (bounded=%s)",
+      async (surface, bounded) => {
+        const fixture = await connect({
+          surface,
+          ...(bounded
+            ? { actionCatalogByteBudget: OMNICODEX_CHATGPT_ACTION_CATALOG_BYTE_BUDGET }
+            : {}),
+        });
+        try {
+          const tools = (await fixture.client.listTools()).tools;
+          const stop = tools.find((tool) => tool.name === toolName);
+          expect(tools.filter((tool) => tool.name === toolName)).toHaveLength(1);
+          expect(stop?.inputSchema).toEqual({
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          });
+          expect(stop?.annotations).toEqual(ALL_FALSE_ANNOTATIONS);
+          expect(await fixture.handle.classifyToolCall(toolName, {})).toBe("non_model");
+          const search = await fixture.client.callTool({
+            name: "search_native_tools",
+            arguments: { query: toolName, modelEffect: "none" },
+          });
+          expect(search.isError).not.toBe(true);
+          expect(objectValue(search.structuredContent).tools).toEqual([
+            expect.objectContaining({
+              name: toolName,
+              modelEffect: "none",
+              invokesModel: false,
+              route: "omnicodex_browser_activity",
+              executeWith: toolName,
+              executeArguments: {},
+              nativeTool: expect.objectContaining({ inputSchema: stop?.inputSchema }),
+            }),
+          ]);
+        } finally {
+          await fixture.close();
+        }
+      },
+    );
+
+    it.each([
+      [
+        "owner",
+        {},
+        ["authorizationBinding", "mutationReplayStore", "legacyMutationCoordinator"],
+        "AUTHENTICATED_OWNER_REQUIRED",
+      ],
+      ["Work resolver", {}, ["resolveDurableWorkSessionBinding"], "DURABLE_WORK_SESSION_REQUIRED"],
+      [
+        "empty Work binding",
+        { resolveDurableWorkSessionBinding: () => workSession("") },
+        [],
+        "DURABLE_WORK_SESSION_REQUIRED",
+      ],
+      [
+        "failed Work binding",
+        {
+          resolveDurableWorkSessionBinding: () => {
+            throw new Error("fixture binding unavailable");
+          },
+        },
+        [],
+        "DURABLE_WORK_SESSION_UNAVAILABLE",
+      ],
+      ["executor", {}, ["browserNativeExecutor"], "LIFECYCLE_UNAVAILABLE"],
+      ["coordinator", {}, ["browserActivityCoordinator"], "LIFECYCLE_UNAVAILABLE"],
+      ["durable semantic fence", {}, ["legacyMutationCoordinator"], "DURABLE_FENCE_REQUIRED"],
+      [
+        "executor lifecycle methods",
+        { browserNativeExecutor: { call: async () => ({ content: [] }) } },
+        [],
+        "LIFECYCLE_UNAVAILABLE",
+      ],
+      [
+        "coordinator Stop method",
+        {
+          browserActivityCoordinator: {
+            observeActivityBoundary: async () => {},
+            coordinate: async (_executor, context) => context,
+            close: async () => {},
+          },
+        },
+        [],
+        "LIFECYCLE_UNAVAILABLE",
+      ],
+    ] satisfies readonly [
+      string,
+      Partial<OmniCodexMcpServerOptions>,
+      (keyof OmniCodexMcpServerOptions)[],
+      string,
+    ][])("rejects Stop without a server-owned %s", async (_name, overrides, omitted, code) => {
+      const fixture = await connect(overrides, omitted);
+      try {
+        for (const id of [undefined, "stop-binding-validation-explicit"]) {
+          const result = await fixture.client.callTool(stopRequest(id));
+          expect(result.isError).toBe(true);
+          expect(JSON.stringify(result.content)).toContain(code);
+        }
+        expect(fixture.scheduler.requests).toHaveLength(0);
+        expect(fixture.executor.finishActivity).not.toHaveBeenCalled();
+        expect(fixture.executor.finishCurrentActivity).not.toHaveBeenCalled();
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it.each([
+      "ownerBinding",
+      "workSessionBinding",
+      "sessionId",
+      "contextThreadId",
+      "contextTurnId",
+      "tabId",
+      "_omnicodexSession",
+      "omnicodexInvocationId",
+      "_omnicodexGoal",
+    ])("rejects caller-supplied %s instead of selecting a target", async (key) => {
+      const fixture = await connect();
+      try {
+        const result = await fixture.client.callTool({
+          name: toolName,
+          arguments: { [key]: "not-authoritative" },
+        });
+        expect(result.isError).toBe(true);
+        expect(fixture.scheduler.requests).toHaveLength(0);
+        expect(fixture.executor.finishActivity).not.toHaveBeenCalled();
+        expect(fixture.executor.finishCurrentActivity).not.toHaveBeenCalled();
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("drains admitted calls before scheduling exact owner/Work cleanup and awaits its result", async () => {
+      const fixture = await connect();
+      const admitted = gate();
+      const drain = gate();
+      const cleanup = gate();
+      const stopSpy = vi.spyOn(fixture.coordinator, "finishCurrentActivity");
+      fixture.executor.finishActivity.mockImplementation(async () => cleanup.promise);
+      let delivered = false;
+      const active = fixture.coordinator.runWithActivity(
+        fixture.executor,
+        activityContext,
+        async () => {
+          admitted.resolve();
+          await drain.promise;
+        },
+      );
+      await admitted.promise;
+      try {
+        const stop = fixture.client.callTool({ name: toolName, arguments: {} }).then((result) => {
+          delivered = true;
+          return result;
+        });
+        await vi.waitFor(() => expect(stopSpy).toHaveBeenCalledOnce());
+        expect(fixture.scheduler.requests).toHaveLength(0);
+        drain.resolve();
+        await active;
+        await vi.waitFor(() => expect(fixture.executor.finishActivity).toHaveBeenCalledOnce());
+        expect(delivered).toBe(false);
+        expect(fixture.scheduler.requestFor("browser_activity_stop")).toMatchObject({
+          ownerId: ownerBinding,
+          sessionId: workSessionBinding,
+          entry: { modelEffect: "none", stateEffect: "mutate" },
+        });
+        cleanup.resolve();
+        const result = await stop;
+        expect(result.isError).not.toBe(true);
+        expect(result.content).toEqual([{ type: "text", text: "Browser activity stopped." }]);
+        expect(fixture.observations).toContainEqual(
+          expect.objectContaining({
+            targetNativeName: "browser_activity_stop",
+            modelEffect: "none",
+            stateEffect: "mutate",
+            outcome: "succeeded",
+          }),
+        );
+        expect(fixture.mutations).toContainEqual(
+          expect.objectContaining({ disposition: "dispatch" }),
+        );
+        expect(fixture.executor.call).not.toHaveBeenCalled();
+      } finally {
+        drain.resolve();
+        cleanup.resolve();
+        await active;
+        await fixture.close();
+      }
+    });
+
+    it("never joins another Work session's Stop or retires another owner's activity", async () => {
+      const fixture = await connect();
+      const otherSession = await connect({
+        browserNativeExecutor: fixture.executor,
+        browserActivityCoordinator: fixture.coordinator,
+        scheduler: fixture.scheduler,
+        mutationReplayStore: fixture.mutationReplayStore,
+        legacyMutationCoordinator: fixture.legacyMutationCoordinator,
+        resolveDurableWorkSessionBinding: () => workSession("other-work"),
+      });
+      const otherWork = { ...activityContext, workSessionBinding: "other-work" };
+      const otherOwner = { ...activityContext, ownerBinding: "other-owner" };
+      const cleanup = gate();
+      fixture.executor.finishActivity.mockImplementation(async (_binding, context) => {
+        if (context?.workSessionBinding === workSessionBinding) await cleanup.promise;
+      });
+      const firstActivity = await fixture.coordinator.coordinate(fixture.executor, activityContext);
+      await fixture.coordinator.coordinate(fixture.executor, otherWork);
+      const untouched = await fixture.coordinator.coordinate(fixture.executor, otherOwner);
+      try {
+        const first = fixture.client.callTool({ name: toolName, arguments: {} });
+        await vi.waitFor(() => expect(fixture.executor.finishActivity).toHaveBeenCalledOnce());
+        const second = await otherSession.client.callTool({ name: toolName, arguments: {} });
+        expect(second.isError).not.toBe(true);
+        expect(fixture.executor.finishActivity.mock.calls.map(([, context]) => context)).toEqual([
+          expect.objectContaining({ ownerBinding, workSessionBinding }),
+          expect.objectContaining({ ownerBinding, workSessionBinding: "other-work" }),
+        ]);
+        expect(
+          (await fixture.coordinator.coordinate(fixture.executor, otherOwner)).activityBinding,
+        ).toBe(untouched.activityBinding);
+        cleanup.resolve();
+        expect((await first).isError).not.toBe(true);
+        expect(
+          (await fixture.coordinator.coordinate(fixture.executor, activityContext)).activityBinding,
+        ).not.toBe(firstActivity.activityBinding);
+      } finally {
+        cleanup.resolve();
+        await otherSession.close();
+        await fixture.close();
+      }
+    });
+
+    it("retains failed lifecycle records and never automatically replays ambiguous Stop", async () => {
+      const fixture = await connect();
+      fixture.executor.finishActivity.mockRejectedValueOnce(new Error("fixture cleanup pending"));
+      const original = await fixture.coordinator.coordinate(fixture.executor, activityContext);
+      const reconnected = await connect({
+        appServer: {
+          request: async <T>(method: string): Promise<T> => {
+            if (method !== "mcpServerStatus/list")
+              throw new Error("Unexpected catalog fixture request");
+            return {
+              data: [
+                {
+                  name: "unrelated-catalog-change",
+                  tools: {
+                    inspect: { name: "inspect", inputSchema: { type: "object", properties: {} } },
+                  },
+                },
+              ],
+              nextCursor: null,
+            } as T;
+          },
+        },
+        browserNativeExecutor: fixture.executor,
+        browserActivityCoordinator: fixture.coordinator,
+        scheduler: fixture.scheduler,
+        mutationReplayStore: fixture.mutationReplayStore,
+        legacyMutationCoordinator: fixture.legacyMutationCoordinator,
+      });
+      try {
+        const first = await fixture.client.callTool({ name: toolName, arguments: {} });
+        expect(first.isError).toBe(true);
+        expect(JSON.stringify(first.content)).toContain("MUTATION_OUTCOME_UNKNOWN");
+        expect(JSON.stringify(first.content)).not.toContain("Browser activity stopped.");
+        const before = (await fixture.client.listTools()).tools.find(
+          (tool) => tool.name === toolName,
+        );
+        const after = (await reconnected.client.listTools()).tools.find(
+          (tool) => tool.name === toolName,
+        );
+        expect(objectValue(after?._meta?.omnicodex).catalogRevision).not.toBe(
+          objectValue(before?._meta?.omnicodex).catalogRevision,
+        );
+        const repeated = await reconnected.client.callTool({ name: toolName, arguments: {} });
+        expect(repeated.isError).toBe(true);
+        expect(JSON.stringify(repeated)).toContain("AMBIGUOUS_LEGACY_MUTATION_COHORT");
+        const reclassified = await reconnected.client.callTool({
+          name: toolName,
+          arguments: {},
+          _meta: { "omnicodex/invocationId": "83d93765-93df-4fca-95e4-000000000001" },
+        });
+        expect(reclassified.isError).toBe(true);
+        expect(JSON.stringify(reclassified)).toContain("AMBIGUOUS_LEGACY_MUTATION_COHORT");
+        expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+        await expect(
+          fixture.coordinator.coordinate(fixture.executor, activityContext),
+        ).rejects.toThrow("BROWSER_ACTIVITY_RETIRING");
+        // Explicit lifecycle recovery remains possible; this is not a tool retry.
+        await fixture.coordinator.finishCurrentActivity(
+          fixture.executor,
+          activityContext,
+          (operation) =>
+            fixture.scheduler.run(
+              {
+                ownerId: ownerBinding,
+                sessionId: workSessionBinding,
+                entry: {
+                  nativeNamespace: "omnicodex",
+                  originalName: "browser_activity_stop",
+                  source: "omnicodex",
+                  modelEffect: "none",
+                  stateEffect: "mutate",
+                },
+              },
+              operation,
+            ),
+        );
+        expect(fixture.executor.finishActivity).toHaveBeenCalledTimes(2);
+        expect(fixture.executor.finishActivity.mock.calls.map(([binding]) => binding)).toEqual([
+          original.activityBinding,
+          original.activityBinding,
+        ]);
+      } finally {
+        await reconnected.close();
+        await fixture.close();
+      }
+    });
+
+    it.each(["legacy", "explicit"] as const)(
+      "fences an unknown %s Stop across identities on the same and reconnected transports",
+      async (mode) => {
+        const fixture = await connect();
+        const originalId = mode === "explicit" ? "stop-original-explicit" : undefined;
+        fixture.executor.finishActivity.mockRejectedValueOnce(new Error("native outcome unknown"));
+        await fixture.coordinator.coordinate(fixture.executor, activityContext);
+        const reconnected = await connect({
+          browserNativeExecutor: fixture.executor,
+          browserActivityCoordinator: fixture.coordinator,
+          scheduler: fixture.scheduler,
+          mutationReplayStore: fixture.mutationReplayStore,
+          legacyMutationCoordinator: fixture.legacyMutationCoordinator,
+        });
+        try {
+          const original = await fixture.client.callTool(stopRequest(originalId));
+          expect(original.isError).toBe(true);
+          expect(JSON.stringify(original)).toContain("MUTATION_OUTCOME_UNKNOWN");
+          if (originalId !== undefined) {
+            const exact = await reconnected.client.callTool(stopRequest(originalId));
+            expect(exact.isError).toBe(true);
+            expect(JSON.stringify(exact)).toContain("MUTATION_OUTCOME_UNKNOWN");
+          }
+          for (const [index, client] of [fixture.client, reconnected.client].entries()) {
+            for (const id of [undefined, `stop-new-explicit-${index}`]) {
+              const repeated = await client.callTool(stopRequest(id));
+              expect(repeated.isError).toBe(true);
+              expect(JSON.stringify(repeated)).toContain("AMBIGUOUS_LEGACY_MUTATION_COHORT");
+              expect(JSON.stringify(repeated.content)).not.toContain("Browser activity stopped.");
+            }
+          }
+          expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+          expect(fixture.executor.finishCurrentActivity).not.toHaveBeenCalled();
+          await expect(
+            fixture.coordinator.coordinate(fixture.executor, activityContext),
+          ).rejects.toThrow("BROWSER_ACTIVITY_RETIRING");
+        } finally {
+          await reconnected.close();
+          await fixture.close();
+        }
+      },
+    );
+
+    it("keeps the durable semantic fence after loading persisted records with fresh runtime state", async () => {
+      const directory = await mkdtemp(
+        join(process.env.PI_SCRATCH_DIR ?? tmpdir(), "browser-stop-fence-"),
+      );
+      const snapshotPath = join(directory, "original.json");
+      const coordinator = await LegacyMutationCoordinator.open({ snapshotPath });
+      const fixture = await connect({ legacyMutationCoordinator: coordinator });
+      fixture.executor.finishActivity.mockRejectedValueOnce(new Error("native outcome unknown"));
+      await fixture.coordinator.coordinate(fixture.executor, activityContext);
+      try {
+        expect(
+          (await fixture.client.callTool(stopRequest("stop-before-replacement"))).isError,
+        ).toBe(true);
+        await coordinator.compact();
+        const restoredPath = join(directory, "restored.json");
+        await copyFile(snapshotPath, restoredPath);
+        const restoredCoordinator = await LegacyMutationCoordinator.open({
+          snapshotPath: restoredPath,
+        });
+        // A different snapshot path opens a fresh core from persisted bytes,
+        // not the process-shared map, just like a replacement process would.
+        const restored = await connect({ legacyMutationCoordinator: restoredCoordinator });
+        try {
+          for (const id of ["stop-after-replacement", undefined]) {
+            const result = await restored.client.callTool(stopRequest(id));
+            expect(result.isError).toBe(true);
+            expect(JSON.stringify(result)).toContain("AMBIGUOUS_LEGACY_MUTATION_COHORT");
+          }
+          expect(restored.executor.finishActivity).not.toHaveBeenCalled();
+          expect(restored.executor.finishCurrentActivity).not.toHaveBeenCalled();
+          // A fence rejection before entry must not strand the restored placeholder.
+          await expect(
+            restored.coordinator.coordinate(restored.executor, activityContext),
+          ).resolves.toBeDefined();
+        } finally {
+          await restored.close();
+        }
+      } finally {
+        await fixture.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("partitions an unknown semantic Stop by authenticated owner and durable Work session", async () => {
+      const fixture = await connect();
+      fixture.executor.finishActivity.mockRejectedValueOnce(new Error("native outcome unknown"));
+      await fixture.coordinator.coordinate(fixture.executor, activityContext);
+      try {
+        expect(
+          (await fixture.client.callTool(stopRequest("stop-unknown-owner-work"))).isError,
+        ).toBe(true);
+        for (const scope of [
+          { ownerBinding, workSessionBinding: "another-work" },
+          { ownerBinding: "another-owner", workSessionBinding },
+        ]) {
+          const scoped = await connect({
+            authorizationBinding: scope.ownerBinding,
+            resolveDurableWorkSessionBinding: () => workSession(scope.workSessionBinding),
+            browserNativeExecutor: fixture.executor,
+            browserActivityCoordinator: fixture.coordinator,
+            scheduler: fixture.scheduler,
+            mutationReplayStore: fixture.mutationReplayStore,
+            legacyMutationCoordinator: fixture.legacyMutationCoordinator,
+          });
+          try {
+            await fixture.coordinator.coordinate(fixture.executor, {
+              ...activityContext,
+              ...scope,
+            });
+            expect(
+              (
+                await scoped.client.callTool(
+                  stopRequest(`stop-${scope.ownerBinding}-${scope.workSessionBinding}`),
+                )
+              ).isError,
+            ).not.toBe(true);
+            expect(fixture.executor.finishActivity.mock.calls.at(-1)?.[1]).toMatchObject(scope);
+          } finally {
+            await scoped.close();
+          }
+        }
+        expect(fixture.executor.finishActivity).toHaveBeenCalledTimes(3);
+        await expect(
+          fixture.coordinator.coordinate(fixture.executor, activityContext),
+        ).rejects.toThrow("BROWSER_ACTIVITY_RETIRING");
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("admits a new Stop only after authoritative completion of the prior semantic cohort", async () => {
+      const fixture = await connect();
+      try {
+        await fixture.coordinator.coordinate(fixture.executor, activityContext);
+        expect((await fixture.client.callTool(stopRequest("stop-completed-one"))).isError).not.toBe(
+          true,
+        );
+        expect((await fixture.client.callTool(stopRequest("stop-completed-one"))).isError).not.toBe(
+          true,
+        );
+        expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+        await fixture.coordinator.coordinate(fixture.executor, activityContext);
+        expect((await fixture.client.callTool(stopRequest("stop-completed-two"))).isError).not.toBe(
+          true,
+        );
+        expect(fixture.executor.finishActivity).toHaveBeenCalledTimes(2);
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("reopens activity after proven scheduler pre-dispatch cancellation", async () => {
+      const fixture = await connect();
+      const original = await fixture.coordinator.coordinate(fixture.executor, activityContext);
+      vi.spyOn(fixture.scheduler, "run").mockRejectedValueOnce(
+        new Error("cancelled before dispatch"),
+      );
+      try {
+        const cancelled = await fixture.client.callTool(
+          stopRequest("stop-cancelled-before-dispatch"),
+        );
+        expect(cancelled.isError).toBe(true);
+        expect(fixture.executor.finishActivity).not.toHaveBeenCalled();
+        expect(
+          (await fixture.coordinator.coordinate(fixture.executor, activityContext)).activityBinding,
+        ).toBe(original.activityBinding);
+        expect(
+          (await fixture.client.callTool(stopRequest("stop-after-proven-cancellation"))).isError,
+        ).not.toBe(true);
+        expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("keeps cross-ID Stop fencing when cleanup succeeds but its explicit receipt commit fails", async () => {
+      const fixture = await connect();
+      const acquire = fixture.mutationReplayStore.acquire.bind(fixture.mutationReplayStore);
+      vi.spyOn(fixture.mutationReplayStore, "acquire").mockImplementationOnce(async (identity) => {
+        const acquisition = await acquire(identity);
+        if (acquisition.kind === "execute")
+          vi.spyOn(acquisition.execution, "complete").mockRejectedValueOnce(
+            new Error("receipt commit failed"),
+          );
+        return acquisition;
+      });
+      try {
+        await fixture.coordinator.coordinate(fixture.executor, activityContext);
+        const first = await fixture.client.callTool(stopRequest("stop-uncommitted-receipt"));
+        expect(first.isError).toBe(true);
+        expect(JSON.stringify(first)).toContain("MUTATION_OUTCOME_UNKNOWN");
+        expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+        await fixture.coordinator.coordinate(fixture.executor, activityContext);
+        for (const id of ["stop-reminted-after-receipt-failure", undefined]) {
+          const retry = await fixture.client.callTool(stopRequest(id));
+          expect(retry.isError).toBe(true);
+          expect(JSON.stringify(retry)).toContain("AMBIGUOUS_LEGACY_MUTATION_COHORT");
+        }
+        expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("releases a durable Stop cohort when cancellation proves cleanup never entered", async () => {
+      const cancellation = new AbortController();
+      cancellation.abort();
+      const fixture = await connect({
+        scheduler: new BoundarySignalScheduler(cancellation.signal),
+      });
+      const acquire = vi.spyOn(fixture.legacyMutationCoordinator, "acquire");
+      const original = await fixture.coordinator.coordinate(fixture.executor, activityContext);
+      try {
+        const request = stopRequest("stop-cancelled-after-durable-admission");
+        expect((await fixture.client.callTool(request)).isError).toBe(true);
+        expect(acquire).toHaveBeenCalledOnce();
+        expect(fixture.executor.finishActivity).not.toHaveBeenCalled();
+        const semanticDigest = acquire.mock.calls[0]?.[0].semanticDigest;
+        if (semanticDigest === undefined) throw new Error("Missing durable Stop cohort");
+        expect(
+          (
+            await fixture.legacyMutationCoordinator.readStatus({
+              authorizationBinding: ownerBinding,
+              semanticDigest,
+            })
+          ).matches,
+        ).toHaveLength(0);
+        expect(
+          (await fixture.coordinator.coordinate(fixture.executor, activityContext)).activityBinding,
+        ).toBe(original.activityBinding);
+        const reconnected = await connect({
+          browserNativeExecutor: fixture.executor,
+          browserActivityCoordinator: fixture.coordinator,
+          mutationReplayStore: fixture.mutationReplayStore,
+          legacyMutationCoordinator: fixture.legacyMutationCoordinator,
+        });
+        try {
+          // Exact identity may retry when both durable coordinators know no I/O happened.
+          expect((await reconnected.client.callTool(request)).isError).not.toBe(true);
+          expect(fixture.executor.finishActivity).toHaveBeenCalledOnce();
+        } finally {
+          await reconnected.close();
+        }
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    it("uses the durable executor cleanup path after coordinator replacement", async () => {
+      const fixture = await connect();
+      try {
+        const result = await fixture.client.callTool({ name: toolName, arguments: {} });
+        expect(result.isError).not.toBe(true);
+        expect(fixture.executor.beginActivity).not.toHaveBeenCalled();
+        expect(fixture.executor.finishActivity).not.toHaveBeenCalled();
+        expect(fixture.executor.finishCurrentActivity).toHaveBeenCalledWith(
+          expect.objectContaining({
+            ownerBinding,
+            workSessionBinding,
+          }),
+        );
+      } finally {
+        await fixture.close();
+      }
+    });
+  });
+
   it.each(["direct", "generic"] as const)(
     "retains a bare explicit browser error across the %s MCP boundary",
     async (route) => {
@@ -8227,7 +8925,7 @@ describe("OmniCodex MCP server", () => {
     ["compat", true],
     ["full", true],
   ] as const)(
-    "preserves native browser execution metadata in %s tools with large schema %s",
+    "publishes the browser timeout and retains native browser metadata in %s tools with large schema %s",
     async (surface, largeSchema) => {
       const timeout = {
         type: "integer",
@@ -8280,7 +8978,15 @@ describe("OmniCodex MCP server", () => {
           "chrome__list_user_tabs",
         ]) {
           const direct = listed.tools.find((tool) => tool.name === name);
-          expect(direct?.inputSchema.properties?.timeout_ms).toEqual(timeout);
+          expect(direct?.inputSchema.properties?.timeout_ms).toEqual({
+            ...timeout,
+            default: 90_000,
+            description: expect.stringContaining("90000 ms"),
+          });
+          expect(
+            (direct?.inputSchema.properties?.timeout_ms as { description?: string } | undefined)
+              ?.description,
+          ).toContain(timeout.description);
           expect(direct?.inputSchema.properties?.title).toEqual(title);
           expect(direct?.inputSchema.required ?? []).not.toContain("timeout_ms");
           const nativeSchema = structuredClone(direct?.inputSchema);

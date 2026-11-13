@@ -252,7 +252,7 @@ describe("CodeModeNativeToolSurface", () => {
     expect(completed.steps[0]?.reservation?.state).toBe("outcome_unknown");
   });
   it.each(["host", "downstream"] as const)(
-    "preserves installed browser execution parameter metadata from %s and refreshes it with the native catalog",
+    "publishes the browser wrapper timeout while retaining native validation metadata from %s",
     (route) => {
       const timeout = {
         type: "integer",
@@ -299,7 +299,11 @@ describe("CodeModeNativeToolSurface", () => {
       const published = codeModeBrowserNativeTools(native.tool);
       for (const name of names) {
         const schema = published.find((tool) => tool.name === name)?.inputSchema;
-        expect(schema?.properties?.timeout_ms).toEqual(timeout);
+        expect(schema?.properties?.timeout_ms).toEqual({
+          ...timeout,
+          default: 90_000,
+          description: expect.stringContaining("90000 ms"),
+        });
         expect(schema?.properties?.title).toEqual(title);
         expect(schema?.required ?? []).not.toContain("timeout_ms");
         expect(
@@ -311,11 +315,18 @@ describe("CodeModeNativeToolSurface", () => {
       timeout.default = 60_000;
       expect(
         published.find((tool) => tool.name === names[0])?.inputSchema.properties?.timeout_ms,
-      ).toMatchObject({ default: 45_000 });
+      ).toMatchObject({ default: 90_000 });
       const refreshed = flattenDynamicTools(fixture.surface.dynamicToolSpecs);
       for (const name of names) {
         expect(refreshed.get(name)?.inputSchema).toMatchObject({
-          properties: { timeout_ms: timeout, title },
+          properties: {
+            timeout_ms: {
+              ...timeout,
+              default: 90_000,
+              description: expect.stringContaining("90000 ms"),
+            },
+            title,
+          },
         });
       }
     },

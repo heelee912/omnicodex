@@ -112,6 +112,7 @@ import {
   type LegacyMutationAcquisition,
   LegacyMutationAmbiguityError,
   type LegacyMutationCoordinator,
+  type LegacyMutationExecution,
   type LegacyMutationTerminal,
 } from "./legacy-mutation-coordinator.js";
 import {
@@ -147,6 +148,11 @@ export type BrowserNativeToolExecutor = Pick<BrowserNativeExecutor, "call"> &
       "callCua" | "beginActivity" | "finishActivity" | "finishCurrentActivity"
     >
   >;
+
+interface BrowserActivityStopOutcome {
+  execution?: LegacyMutationExecution<null>;
+  cleanupSucceeded?: boolean;
+}
 
 export const OMNICODEX_MCP_SERVER_NAME = "OmniCodex";
 export const OMNICODEX_ACTIVITY_RESOURCE_URI = "ui://omnicodex/activity/v1.html";
@@ -712,10 +718,12 @@ const genericToolNames = ["search_native_tools", "call_native_tool", "app_server
 const deliveredCuaDocumentationByExecutor = new WeakMap<object, Set<string>>();
 const deliveredCuaDocumentationByWorkSession = new Map<string, Set<string>>();
 const OMNICODEX_SESSION_IDENTITY_TOOL = "codex__omnicodex__session_identity";
+const OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL = "codex__omnicodex__browser_activity_stop";
 export const OMNICODEX_ATTACH_LOCAL_FILE_TOOL = "codex__omnicodex__attach_local_file";
 const reservedToolNames = [
   ...genericToolNames,
   OMNICODEX_SESSION_IDENTITY_TOOL,
+  OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL,
   PROTECTED_RESULT_READ_TOOL,
   LEGACY_MUTATION_STATUS_TOOL,
   OMNICODEX_ATTACH_LOCAL_FILE_TOOL,
@@ -1308,6 +1316,7 @@ export function createOmniCodexMcpServer(
     browserCallContext: BrowserNativeCallContext = {},
     invocationIdSha256?: string,
     requestAttribution?: McpRequestAttributionObservation,
+    browserStopOutcome?: BrowserActivityStopOutcome,
   ): Promise<CallToolResult> => {
     let observation: Omit<NativeToolExecutionObservation, "outcome"> = {
       ...(options.correlationId === undefined ? {} : { correlationId: options.correlationId }),
@@ -1334,6 +1343,86 @@ export function createOmniCodexMcpServer(
       const registry = await registryForCall();
       const advertisedEntry = advertisedFullEntry(registry, name);
       const dispatchName = advertisedEntry?.dispatchName ?? name;
+      if (name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL) {
+        const stop = requireBrowserActivityStop(options, browserCallContext, args);
+        if (browserStopOutcome === undefined)
+          throw new Error("BROWSER_ACTIVITY_STOP_OUTCOME_TRACKER_REQUIRED");
+        observation = {
+          ...observation,
+          targetNativeName: "browser_activity_stop",
+          targetNamespace: "omnicodex",
+          targetRoute: "mcp_control",
+          modelEffect: "none",
+          stateEffect: "mutate",
+        };
+        // Mark retiring and drain admitted calls before reserving their native
+        // lanes. Holding a lane while waiting for those calls would deadlock.
+        await stop.finishCurrentActivity(stop.executor, browserCallContext, async (cleanup) => {
+          await scheduler.run(
+            {
+              ownerId: stop.ownerBinding,
+              sessionId: stop.workSessionBinding,
+              entry: {
+                nativeNamespace: "omnicodex",
+                originalName: "browser_activity_stop",
+                source: "omnicodex",
+                modelEffect: "none",
+                stateEffect: "mutate",
+              },
+              ...(operationId === undefined ? {} : { operationId }),
+              ...(signal === undefined ? {} : { signal }),
+            },
+            async (operationSignal) => {
+              // One durable semantic cohort covers every caller identity mode.
+              // A distinct physical attempt gets a server-owned session identity,
+              // so the legacy coordinator cannot treat a new request ID on the
+              // same transport as permission to bypass an unresolved Stop.
+              const fenceOperationId = operationId ?? randomUUID();
+              const fence = await stop.mutationCoordinator.acquire<null>({
+                authorizationBinding: stop.ownerBinding,
+                semanticDigest: semanticDigest({
+                  contract: "omnicodex-browser-activity-stop-fence-v1",
+                  workSessionBinding: stop.workSessionBinding,
+                  target: "browser_activity_stop",
+                }),
+                sessionId: `browser-stop-fence:${fenceOperationId}`,
+                requestId: "cleanup",
+              });
+              if (fence.kind !== "execute")
+                throw new Error("BROWSER_ACTIVITY_STOP_FENCE_REQUIRES_FRESH_OPERATION");
+              browserStopOutcome.execution = fence.execution;
+              let cleanupEntered = false;
+              try {
+                operationSignal?.throwIfAborted();
+                // Defer the mutation boundary until the semantic fence admits
+                // this attempt under the scheduler's owner/Work resource lock.
+                await beforeNativeDispatch?.();
+                operationSignal?.throwIfAborted();
+                cleanupEntered = true;
+                await cleanup();
+                // Keep the durable fence unresolved until the outer mutation
+                // receipt commits too; a result-commit error is still UNKNOWN.
+                browserStopOutcome.cleanupSucceeded = true;
+              } catch (error) {
+                await (cleanupEntered
+                  ? fence.execution.outcomeUnknown("BROWSER_ACTIVITY_STOP_CLEANUP_UNKNOWN")
+                  : fence.execution.failBeforeDispatch("BROWSER_ACTIVITY_STOP_NOT_ENTERED")
+                ).catch(() => undefined);
+                throw error;
+              }
+            },
+          );
+        });
+        const result: CallToolResult = {
+          content: [{ type: "text", text: "Browser activity stopped." }],
+        };
+        await observeExecution(options, {
+          ...observation,
+          ...resultSummary(result),
+          outcome: "succeeded",
+        });
+        return result;
+      }
       if (name === "search_native_tools") {
         await beforeNativeDispatch?.();
         const result = await searchNativeTools(
@@ -1702,6 +1791,17 @@ export function createOmniCodexMcpServer(
     const registry = pinnedRegistry ?? (await registryForCall());
     const advertisedEntry = advertisedFullEntry(registry, name);
     const dispatchName = advertisedEntry?.dispatchName ?? name;
+    if (name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL) {
+      const entry = browserActivityStopCatalogEntry(registry.revision);
+      return {
+        catalogRevision: registry.revision,
+        stateEffect: "mutate",
+        modelEffect: "none",
+        targetIdentity: entry.toolId,
+        // Unrelated catalog refreshes cannot authorize replay of an unknown Stop.
+        targetContractDigest: semanticDigest(withoutCatalogRevision(entry.tool)),
+      };
+    }
     if (name === "search_native_tools") {
       return {
         catalogRevision: registry.revision,
@@ -1881,6 +1981,7 @@ export function createOmniCodexMcpServer(
     },
     transportReadInvocation?: ReadInvocationIdentity,
     requestAttribution?: McpRequestAttributionObservation,
+    browserStopOutcome?: BrowserActivityStopOutcome,
   ): Promise<CallToolResult> => {
     const replayStore = options.mutationReplayStore;
     const legacyCoordinator = options.legacyMutationCoordinator;
@@ -1888,7 +1989,23 @@ export function createOmniCodexMcpServer(
     if (!split.ok) return errorResult(split.message);
     const invocationIdentityInputs = mutationIdentityInputPresence(args, requestMeta);
     const nativeArguments = split.arguments;
-    const context = await callStateContext(name, nativeArguments);
+    if (name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL) {
+      try {
+        requireBrowserActivityStop(options, browserCallContext, nativeArguments);
+      } catch (error) {
+        return errorResultFrom(error);
+      }
+    }
+    const stateContext = await callStateContext(name, nativeArguments);
+    // Empty Stop arguments still identify a mutation in exactly one durable
+    // Work session. An owner's other sessions must never join/replay its Stop.
+    const context =
+      name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL
+        ? {
+            ...stateContext,
+            targetIdentity: `${stateContext.targetIdentity}:${semanticDigest(browserCallContext.workSessionBinding)}`,
+          }
+        : stateContext;
     const beforeNativeDispatch = (
       next?: () => Promise<void>,
     ): (() => Promise<void>) | undefined => {
@@ -2349,6 +2466,7 @@ export function createOmniCodexMcpServer(
           browserCallContext,
           split.invocationIdSha256,
           requestAttribution,
+          browserStopOutcome,
         );
         if (!nativeDispatchStarted) {
           await execution.failBeforeDispatch("NATIVE_CALL_REJECTED_BEFORE_DISPATCH");
@@ -2473,9 +2591,8 @@ export function createOmniCodexMcpServer(
         acquisition.operationId,
         true,
         beforeNativeDispatch(async () => {
-          // A new explicit ID cannot turn an unresolved legacy Chrome call into
-          // a fresh intent. Check the same owner and semantics under the existing
-          // scheduler resource lock, without changing the legacy record.
+          // A new explicit ID cannot reclassify an unresolved legacy Chrome
+          // mutation as fresh intent. Stop has its own cross-mode semantic fence.
           if (name === "chrome__control_chrome" && legacyCoordinator !== undefined) {
             let cursor: string | undefined;
             do {
@@ -2499,6 +2616,7 @@ export function createOmniCodexMcpServer(
         browserCallContext,
         split.invocationIdSha256,
         requestAttribution,
+        browserStopOutcome,
       );
       if (!nativeDispatchStarted) {
         await execution.failBeforeDispatch("NATIVE_CALL_REJECTED_BEFORE_DISPATCH");
@@ -3319,6 +3437,16 @@ export function createOmniCodexMcpServer(
         }
       }
     } else {
+      const browserStopOutcome: BrowserActivityStopOutcome | undefined =
+        request.params.name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL ? {} : undefined;
+      if (
+        request.params.name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL &&
+        Object.keys(request.params.arguments ?? {}).length !== 0
+      ) {
+        // Validate the original wire arguments, before legacy context stripping
+        // or mutation/Goal envelopes can hide a caller-selected identifier.
+        result = errorResult("BROWSER_ACTIVITY_STOP_ARGUMENTS_MUST_BE_EMPTY");
+      }
       let directArguments: ReturnType<typeof splitDirectGoalContext>;
       try {
         directArguments = splitDirectGoalContext(rawArguments);
@@ -3355,7 +3483,26 @@ export function createOmniCodexMcpServer(
           undefined,
           transportReadInvocation,
           requestAttributionObservation(requestAttribution),
+          browserStopOutcome,
         );
+        if (browserStopOutcome?.execution !== undefined) {
+          if (result.isError !== true && browserStopOutcome.cleanupSucceeded === true) {
+            try {
+              await browserStopOutcome.execution.finish(null);
+            } catch (error) {
+              await browserStopOutcome.execution
+                .outcomeUnknown("BROWSER_ACTIVITY_STOP_RESULT_COMMIT_FAILED")
+                .catch(() => undefined);
+              result = errorResultFrom(error, "MUTATION_OUTCOME_UNKNOWN");
+            }
+          } else {
+            // Cancellation can end the caller's wait before physical cleanup
+            // settles. Never promote a later completion into automatic replay.
+            await browserStopOutcome.execution
+              .outcomeUnknown("BROWSER_ACTIVITY_STOP_OUTCOME_UNKNOWN")
+              .catch(() => undefined);
+          }
+        }
       }
     }
     if (result === undefined) result = errorResult("OMNICODEX_CALL_ROUTING_FAILED");
@@ -3475,6 +3622,7 @@ export function createOmniCodexMcpServer(
     classifyToolCall: async (name, args) => {
       if (
         name === OMNICODEX_SESSION_IDENTITY_TOOL ||
+        name === OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL ||
         name === PROTECTED_RESULT_READ_TOOL ||
         name === LEGACY_MUTATION_STATUS_TOOL ||
         name === OMNICODEX_ATTACH_LOCAL_FILE_TOOL
@@ -4902,6 +5050,7 @@ interface DirectSearchTool {
     | "omnicodex_goal"
     | "omnicodex_router"
     | "omnicodex_schedule"
+    | "omnicodex_browser_activity"
     | "omnicodex_session";
   readonly catalogRevision: string;
 }
@@ -5544,6 +5693,7 @@ export const OMNICODEX_FULL_CATALOG_PRIORITY = [
   "codex_app__load_workspace_dependencies",
   "codex_app__open_in_codex",
   OMNICODEX_SESSION_IDENTITY_TOOL,
+  OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL,
   PROTECTED_RESULT_READ_TOOL,
   LEGACY_MUTATION_STATUS_TOOL,
   OMNICODEX_ATTACH_LOCAL_FILE_TOOL,
@@ -5582,6 +5732,7 @@ const OMNICODEX_CHATGPT_MANDATORY_ACTIONS = new Set<string>([
   // Web Pro can use the same path as Codex Desktop.
   "view_image",
   OMNICODEX_SESSION_IDENTITY_TOOL,
+  OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL,
   PROTECTED_RESULT_READ_TOOL,
   LEGACY_MUTATION_STATUS_TOOL,
 ]);
@@ -5650,6 +5801,7 @@ function fullCatalogEntries(
     };
   });
   entries.push(sessionIdentityCatalogEntry(registry.revision));
+  entries.push(browserActivityStopCatalogEntry(registry.revision));
   entries.push(protectedResultReadCatalogEntry(registry.revision));
   entries.push(legacyMutationStatusCatalogEntry(registry.revision));
   entries.push(attachLocalFileCatalogEntry(registry.revision));
@@ -5858,6 +6010,80 @@ function compareFullCatalogEntries(left: FullCatalogEntry, right: FullCatalogEnt
     left.inputSchemaSha256.localeCompare(right.inputSchemaSha256, "en") ||
     left.toolId.localeCompare(right.toolId, "en")
   );
+}
+
+function requireBrowserActivityStop(
+  options: OmniCodexMcpServerOptions,
+  context: BrowserNativeCallContext,
+  args: Record<string, unknown>,
+) {
+  if (Object.keys(args).length !== 0)
+    throw new Error("BROWSER_ACTIVITY_STOP_ARGUMENTS_MUST_BE_EMPTY");
+  const ownerBinding = options.authorizationBinding;
+  if (!ownerBinding || context.ownerBinding !== ownerBinding)
+    throw new Error("BROWSER_ACTIVITY_STOP_AUTHENTICATED_OWNER_REQUIRED");
+  const workSessionBinding = context.workSessionBinding;
+  if (options.resolveDurableWorkSessionBinding === undefined || !workSessionBinding)
+    throw new Error("BROWSER_ACTIVITY_STOP_DURABLE_WORK_SESSION_REQUIRED");
+  const executor = options.browserNativeExecutor;
+  const coordinator = options.browserActivityCoordinator;
+  if (
+    executor?.beginActivity === undefined ||
+    executor.finishActivity === undefined ||
+    executor.finishCurrentActivity === undefined ||
+    coordinator?.finishCurrentActivity === undefined
+  ) {
+    throw new Error("BROWSER_ACTIVITY_STOP_LIFECYCLE_UNAVAILABLE");
+  }
+  const mutationCoordinator = options.legacyMutationCoordinator;
+  if (mutationCoordinator === undefined)
+    throw new Error("BROWSER_ACTIVITY_STOP_DURABLE_FENCE_REQUIRED");
+  return {
+    executor: executor as BrowserActivityLifecycleExecutor,
+    finishCurrentActivity: coordinator.finishCurrentActivity.bind(coordinator),
+    ownerBinding,
+    workSessionBinding,
+    mutationCoordinator,
+  };
+}
+
+function browserActivityStopCatalogEntry(catalogRevision: string): FullCatalogEntry {
+  const nativeName = "browser_activity_stop";
+  const toolId = firstClassToolId("function", "omnicodex", "omnicodex", nativeName);
+  const revisionIdentity = {
+    kind: "function",
+    origin: "omnicodex",
+    route: "omnicodex_browser_activity",
+    modelEffect: "none",
+    invokesModel: false,
+    stateEffect: "mutate",
+  } as const;
+  const tool = publicActionTool(
+    withCatalogRevision(
+      {
+        name: OMNICODEX_BROWSER_ACTIVITY_STOP_TOOL,
+        title: "Stop the current Work session's Browser activity",
+        description:
+          "Stop Browser activity only in the authenticated current Work session and await native cleanup. Does not claim tabs were closed or anything submitted. No identifiers accepted. Never automatically retry an unknown outcome.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        _meta: {
+          omnicodex: { ...revisionIdentity, toolId, nativeName, nativeNamespace: "omnicodex" },
+        },
+      } as Tool,
+      catalogRevision,
+    ),
+  );
+  return {
+    name: tool.name,
+    toolId,
+    nativeNamespace: "omnicodex",
+    nativeName,
+    inputSchemaSha256: semanticDigest(tool.inputSchema),
+    revisionIdentity,
+    dispatchKind: "standalone",
+    dispatchName: tool.name,
+    tool,
+  };
 }
 
 function sessionIdentityCatalogEntry(catalogRevision: string): FullCatalogEntry {
@@ -6817,6 +7043,7 @@ function isStandaloneSearchRoute(route: string): route is DirectSearchTool["rout
     "omnicodex_legacy_status",
     "omnicodex_router",
     "omnicodex_schedule",
+    "omnicodex_browser_activity",
     "omnicodex_session",
   ].includes(route);
 }
@@ -6995,6 +7222,7 @@ function searchTargetObservationRoute(
 ): NonNullable<NativeToolExecutionObservation["targetRoute"]> {
   switch (entry.route) {
     case "omnicodex_goal":
+    case "omnicodex_browser_activity":
     case "omnicodex_job":
     case "omnicodex_resource":
     case "omnicodex_result":

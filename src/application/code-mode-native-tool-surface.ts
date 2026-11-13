@@ -621,18 +621,34 @@ export function codeModeBrowserNativeTools(nativeExecutionTool?: Tool): readonly
 
 function browserNativeTools(nativeExecutionTool?: Tool): Tool[] {
   const nativeProperties = nativeExecutionTool?.inputSchema.properties ?? {};
-  // The wrapper dispatches through the installed node_repl/js. Preserve its
-  // parameter contract, including omission defaults, instead of hiding it
-  // behind a generic adapter description.
+  // Preserve native validation and explanatory text while distinguishing the
+  // wrapper's effective deadline from the underlying node_repl/js default.
+  const timeoutDescription =
+    "Optional browser call timeout in milliseconds. OmniCodex defaults to 90000 ms when omitted; an explicit shorter timeout or earlier caller deadline still applies.";
+  const nativeTimeout = nativeProperties.timeout_ms;
+  const nativeTimeoutDescription =
+    typeof nativeTimeout === "object" &&
+    nativeTimeout !== null &&
+    "description" in nativeTimeout &&
+    typeof nativeTimeout.description === "string"
+      ? nativeTimeout.description
+      : undefined;
   const timeoutSchema =
     nativeProperties.timeout_ms === undefined
       ? {
           type: "integer",
           minimum: 1,
-          description:
-            "Optional execution timeout; omission uses the installed node_repl/js default.",
+          default: 90_000,
+          description: timeoutDescription,
         }
-      : structuredClone(nativeProperties.timeout_ms);
+      : {
+          ...structuredClone(nativeProperties.timeout_ms),
+          default: 90_000,
+          description:
+            nativeTimeoutDescription === undefined
+              ? timeoutDescription
+              : `${timeoutDescription} Installed node_repl/js parameter: ${nativeTimeoutDescription}`,
+        };
   const titleSchema =
     nativeProperties.title === undefined
       ? { type: "string" }

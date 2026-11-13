@@ -1624,24 +1624,27 @@ describe("BrowserNativeExecutor", () => {
       "export const browserServiceVersion = 'tracker-removed';",
       "utf8",
     );
-    const calls: Array<{ tool: string; turnId?: string; sessionId?: string }> = [];
+    const calls: Array<{ tool: string; turnId?: string; sessionId?: string; timeoutMs?: number }> =
+      [];
     const createExecutor = () =>
       new BrowserNativeExecutor(
         {
           callInContext: async (
             _server,
             tool,
-            _args,
+            args,
             _thread,
             _progress,
             turnId,
             _signal,
             sessionId,
           ) => {
+            const timeoutMs = (args as { timeout_ms?: unknown }).timeout_ms;
             calls.push({
               tool,
               ...(turnId === undefined ? {} : { turnId }),
               ...(sessionId === undefined ? {} : { sessionId }),
+              ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
             });
             return { ok: true };
           },
@@ -1660,11 +1663,13 @@ describe("BrowserNativeExecutor", () => {
 
     const second = createExecutor();
     await second.call(
-      { operation: "inspect", surface: "chrome", target_tab_id: "tab-42" },
+      { operation: "inspect", surface: "chrome", target_tab_id: "tab-42", timeout_ms: 90_000 },
       context,
     );
 
     expect(calls.map((call) => call.tool)).toEqual(["js", "js", "turn_ended", "js"]);
+    expect(calls[1]?.timeoutMs).toBeGreaterThan(30_000);
+    expect(calls[3]?.timeoutMs).toBeGreaterThan(30_000);
     expect(calls[2]).toMatchObject({
       tool: "turn_ended",
       turnId: firstTurn,
@@ -2783,7 +2788,7 @@ describe("BrowserNativeExecutor", () => {
     );
   });
 
-  it("applies the declared 30 second default to the whole browser call", async () => {
+  it("applies the declared 90 second default to the whole browser call", async () => {
     const root = await mkdtemp(join(tmpdir(), "omnicodex-browser-"));
     await installBrowserClient(root, "1.0.0");
     let observedBoundary: BrowserNativeContextBoundary | undefined;
@@ -2808,10 +2813,11 @@ describe("BrowserNativeExecutor", () => {
     await executor.call({ operation: "list_surfaces" });
 
     expect(observedBoundary?.deadlineUnixMs).toEqual(expect.any(Number));
-    expect((observedBoundary?.deadlineUnixMs as number) - startedAt).toBeLessThanOrEqual(30_000);
+    expect((observedBoundary?.deadlineUnixMs as number) - startedAt).toBeGreaterThan(60_000);
+    expect((observedBoundary?.deadlineUnixMs as number) - startedAt).toBeLessThanOrEqual(90_000);
     expect(observedNativeTimeout).toEqual(expect.any(Number));
-    expect(observedNativeTimeout as number).toBeGreaterThan(0);
-    expect(observedNativeTimeout as number).toBeLessThanOrEqual(30_000);
+    expect(observedNativeTimeout as number).toBeGreaterThan(60_000);
+    expect(observedNativeTimeout as number).toBeLessThanOrEqual(90_000);
   });
 
   it("returns at the browser deadline even when native execution ignores cancellation", async () => {

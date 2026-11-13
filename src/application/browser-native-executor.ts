@@ -141,7 +141,9 @@ export type BrowserNativeExecutionStage =
   | "native_dispatch"
   | "native_returned"
   | "runtime_recovery";
-const DEFAULT_BROWSER_CALL_TIMEOUT_MS = 30_000;
+// Cold native context restoration can exceed 30 seconds before a tab action starts.
+// Explicit caller timeouts and earlier outer deadlines still take precedence.
+const DEFAULT_BROWSER_CALL_TIMEOUT_MS = 90_000;
 
 function observeBrowserExecutionStage(
   context: BrowserNativeCallContext,
@@ -1396,6 +1398,12 @@ export class BrowserNativeExecutor {
             "js",
             {
               code: `await (async () => { const { setupBrowserRuntime } = await import(${JSON.stringify(pathToFileURL(release.target.clientPath).href)}); const agent = await setupBrowserRuntime({ environment: ${JSON.stringify(release.target.environment)} }); for (const info of await agent.browsers.list()) { if (info.type !== "extension" && info.type !== "cdp") continue; const browser = await agent.browsers.get(info.id); await browser.tabs.list(); } })();`,
+              // A restored turn can outlive the installed Node REPL's default
+              // timeout. Keep its native rebind within the caller's exact
+              // remaining boundary, just like ordinary browser dispatch.
+              ...(boundary?.deadlineUnixMs === undefined
+                ? {}
+                : { timeout_ms: remainingBrowserDeadline(boundary.deadlineUnixMs) }),
             },
             release.target.contextThreadId,
             undefined,
