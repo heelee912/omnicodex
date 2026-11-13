@@ -710,7 +710,11 @@ export class NativeExecutionScheduler {
           effectiveRequest.recoverUnknownResourcesWhen?.(result) === true
         ) {
           await this.#resourceLeaseCoordinator?.recoverUnknownResources?.(
-            resourceKeys,
+            // A URL-state read can prove its own window, not an unrelated
+            // session's ambiguous desktop-input mutation.
+            isComputerUseDesktopUrlRead(effectiveRequest.entry)
+              ? resourceKeys.filter((key) => key !== "0:lane:desktop-input")
+              : resourceKeys,
             async (lease) => lease.state === "outcome_unknown",
           );
         }
@@ -767,7 +771,10 @@ function transportDisconnectCancelsOperation(entry: NativeExecutionDescriptor): 
 }
 
 function requiresExclusiveResourceLock(entry: NativeExecutionDescriptor): boolean {
-  return entry.stateEffect !== "read" && entry.stateEffect !== "none";
+  return (
+    (entry.stateEffect !== "read" && entry.stateEffect !== "none") ||
+    isComputerUseDesktopUrlRead(entry)
+  );
 }
 
 class ContextualNativeExecutionScheduler extends NativeExecutionScheduler {
@@ -906,11 +913,10 @@ function durableNativeResourceKeys(
     (key) => lane !== "ui" || !key.startsWith("4:surface:"),
   );
   if (lane === "ui") {
-    if (isComputerUseDesktopMutation(entry)) {
-      // Browser Use drives independent CDP sessions and tabs, but Computer
-      // Use ultimately shares one physical Windows pointer and keyboard.
-      // Serialize only those mutating desktop-input calls globally; reads and
-      // browser DOM/CDP calls retain per-conversation concurrency.
+    if (isComputerUseDesktopMutation(entry) || isComputerUseDesktopUrlRead(entry)) {
+      // Browser CDP calls remain per-session, but one physical Windows desktop
+      // cannot change tabs while another Work session validates its current
+      // browser URL for Computer Use policy.
       canonical.push("0:lane:desktop-input");
     }
     // Explicit tab/window keys remain global. Every other UI runtime is
@@ -933,6 +939,15 @@ function isComputerUseDesktopMutation(entry: NativeExecutionDescriptor): boolean
     entry.stateEffect !== "read" &&
     entry.stateEffect !== "none" &&
     /computer.?use/u.test(descriptorIdentity(entry))
+  );
+}
+
+function isComputerUseDesktopUrlRead(entry: NativeExecutionDescriptor): boolean {
+  const identity = descriptorIdentity(entry);
+  return (
+    entry.stateEffect === "read" &&
+    /computer.?use/u.test(identity) &&
+    /get_window_state/u.test(identity)
   );
 }
 

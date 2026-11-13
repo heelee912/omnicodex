@@ -533,6 +533,75 @@ describe("NativeExecutionScheduler", () => {
     expect(events).toEqual(["a:start", "a:end", "b"]);
   });
 
+  it("orders Computer Use URL-state reads behind another Work session's desktop input", async () => {
+    const scheduler = new NativeExecutionScheduler();
+    const click: NativeExecutionDescriptor = {
+      nativeNamespace: "codex.computer_use",
+      originalName: "codex__computer_use__click",
+      source: "codex_app_host",
+      stateEffect: "mutate",
+    };
+    const stateRead: NativeExecutionDescriptor = {
+      ...click,
+      originalName: "codex__computer_use__get_window_state",
+      stateEffect: "read",
+    };
+    const inventoryRead: NativeExecutionDescriptor = {
+      ...click,
+      originalName: "codex__computer_use__list_windows",
+      stateEffect: "read",
+    };
+    let releaseClick!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseClick = resolve;
+    });
+    const events: string[] = [];
+    const first = scheduler.run(
+      {
+        entry: click,
+        ownerId: "owner",
+        sessionId: "session-a",
+        ordering: { windowId: "window-a" },
+      },
+      async () => {
+        events.push("click:start");
+        await gate;
+        events.push("click:end");
+      },
+    );
+    const urlRead = scheduler.run(
+      {
+        entry: stateRead,
+        ownerId: "owner",
+        sessionId: "session-b",
+        ordering: { windowId: "window-b" },
+      },
+      async () => {
+        events.push("url-read");
+      },
+    );
+    const inventory = scheduler.run(
+      {
+        entry: inventoryRead,
+        ownerId: "owner",
+        sessionId: "session-c",
+        ordering: { windowId: "window-c" },
+      },
+      async () => {
+        events.push("inventory");
+      },
+    );
+    try {
+      await vi.waitFor(() => expect(events).toContain("inventory"));
+      expect(events).not.toContain("url-read");
+    } finally {
+      releaseClick();
+      await Promise.all([first, urlRead, inventory]);
+      await scheduler.shutdown();
+    }
+    expect(events.indexOf("url-read")).toBeGreaterThan(events.indexOf("click:end"));
+  });
+
   it("bounds shell concurrency and removes a cancelled queued call", async () => {
     const scheduler = new NativeExecutionScheduler({ shellConcurrency: 1 });
     let release!: () => void;
@@ -1271,6 +1340,32 @@ describe("NativeExecutionScheduler", () => {
       async () => "tool-error",
     );
     expect(coordinator.recoveryResourceKeys).toHaveLength(1);
+  });
+
+  it("does not clear another session's desktop-input fence after a URL-state read", async () => {
+    const coordinator = new RecordingLeaseCoordinator();
+    const scheduler = new NativeExecutionScheduler({ resourceLeaseCoordinator: coordinator });
+    const stateRead: NativeExecutionDescriptor = {
+      nativeNamespace: "codex.computer_use",
+      originalName: "codex__computer_use__get_window_state",
+      source: "codex_app_host",
+      stateEffect: "read",
+    };
+    await scheduler.run(
+      {
+        entry: stateRead,
+        ownerId: "owner",
+        sessionId: "session-b",
+        ordering: { windowId: "window-one" },
+        recoverUnknownResourcesWhen: () => true,
+      },
+      async () => "url-visible",
+    );
+    expect(coordinator.requests).toEqual([]);
+    expect(coordinator.recoveryResourceKeys).toHaveLength(1);
+    expect(coordinator.recoveryResourceKeys[0]).not.toContain("0:lane:desktop-input");
+    expect(coordinator.recoveryResourceKeys[0]).toContain("4:window:window-one");
+    await scheduler.shutdown();
   });
 
   it("does not head-of-line block concurrent readers of the same native resource", async () => {
