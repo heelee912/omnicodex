@@ -23,12 +23,7 @@ jobs:
           $env:TEMP = $env:RUNNER_TEMP
           $env:TMP = $env:RUNNER_TEMP
           $env:TMPDIR = $env:RUNNER_TEMP
-          # DPAPI uses a real CurrentUser PowerShell child. Run it in a fresh
-          # Vitest process before the long suite so prior test children cannot
-          # exhaust its bounded bridge deadline; do not skip the test.
-          npm test -- --maxWorkers=1 --run test/omnicodex-internal-integrity-key.test.ts
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm test -- --maxWorkers=1 --exclude test/omnicodex-internal-integrity-key.test.ts
+          npm test -- --maxWorkers=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: npm run build
       - run: npm pack --dry-run --json
