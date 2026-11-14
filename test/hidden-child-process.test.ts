@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { HashChainedActionLedger } from "../src/infrastructure/safety/hash-chained-action-ledger.js";
 import {
@@ -304,6 +304,95 @@ describe("HiddenChildProcessBoundary", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  it.skipIf(process.platform !== "win32").each(["async write", "synchronous end"] as const)(
+    "contains probe stdin EPIPE from %s with its cause and exactly one settlement",
+    async (failureMode) => {
+      const directory = await mkdtemp(join(tmpdir(), "omnicodex-probe-stdin-error-"));
+      try {
+        const cause = Object.assign(new Error("write EPIPE"), { code: "EPIPE", syscall: "write" });
+        const stdin = new Writable({
+          write(_chunk, _encoding, callback) {
+            expect(this.listenerCount("error")).toBeGreaterThan(0);
+            setImmediate(() => callback(cause));
+          },
+        });
+        if (failureMode === "synchronous end") {
+          vi.spyOn(stdin, "end").mockImplementation(() => {
+            expect(stdin.listenerCount("error")).toBeGreaterThan(0);
+            throw cause;
+          });
+        }
+        const child = new ControllableJsonChild(9797, stdin);
+        const boundary = new HiddenChildProcessBoundary(
+          () => child as never,
+          join(directory, "actions.jsonl"),
+        );
+        const resolved = vi.fn();
+        const rejected = vi.fn((error: unknown) => error);
+        const inspection = boundary
+          .inspectWindowsProcess(9696, { systemRoot: "C:\\Windows", timeoutMs: 1_000 })
+          .then(resolved, rejected);
+
+        const error = await inspection;
+        expect(error).toMatchObject({
+          message: "OWNED_PROCESS_BOUNDARY_UNVERIFIABLE:probe stdin",
+          cause,
+          stdout: "",
+          stderr: "",
+        });
+        expect((error as Error).cause).toBe(cause);
+        child.complete({ status: "absent" });
+        expect(() => {
+          stdin.emit("error", cause);
+          stdin.emit("error", cause);
+          child.emit("error", new Error("late helper error"));
+        }).not.toThrow();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(resolved).not.toHaveBeenCalled();
+        expect(rejected).toHaveBeenCalledTimes(1);
+        expect(child.signalCount).toBe(0);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32").each(["close", "timeout"] as const)(
+    "keeps late probe stdin errors handled after %s without resettling",
+    async (firstEvent) => {
+      const directory = await mkdtemp(join(tmpdir(), "omnicodex-probe-late-stdin-"));
+      vi.useFakeTimers();
+      try {
+        const child = new ControllableJsonChild(9898);
+        const boundary = new HiddenChildProcessBoundary(
+          () => child as never,
+          join(directory, "actions.jsonl"),
+        );
+        const settled = vi.fn((value: unknown) => value);
+        const inspection = boundary
+          .inspectWindowsProcess(9696, { systemRoot: "C:\\Windows", timeoutMs: 10 })
+          .then(settled, settled);
+        if (firstEvent === "close") child.complete({ status: "absent" });
+        else await vi.advanceTimersByTimeAsync(10);
+        const result = await inspection;
+        if (firstEvent === "close") expect(result).toBeUndefined();
+        else
+          expect(result).toMatchObject({ message: "OWNED_PROCESS_BOUNDARY_UNVERIFIABLE:timeout" });
+        expect(() => {
+          child.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+          child.stdin.emit("error", new Error("late pipe error"));
+        }).not.toThrow();
+        child.complete({ status: "absent" });
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(settled).toHaveBeenCalledTimes(1);
+        expect(child.signalCount).toBe(firstEvent === "timeout" ? 1 : 0);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 class FakeChild extends EventEmitter {
@@ -341,9 +430,14 @@ class FakeJsonChild extends FakeChild {
 }
 
 class ControllableJsonChild extends FakeChild {
-  readonly stdin = new PassThrough();
+  readonly stdin: Writable;
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+
+  constructor(pid: number, stdin: Writable = new PassThrough()) {
+    super(pid);
+    this.stdin = stdin;
+  }
 
   complete(output: unknown): void {
     this.stdout.end(JSON.stringify(output));

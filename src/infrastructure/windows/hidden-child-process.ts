@@ -379,8 +379,7 @@ export class HiddenChildProcessBoundary {
       },
     );
     if (child.stdin === null) throw new Error("OWNED_PROCESS_BOUNDARY_UNVERIFIABLE:stdin");
-    child.stdin.end(JSON.stringify(input), "utf8");
-    return collectHiddenJson(this, child, timeoutMs);
+    return collectHiddenJson(this, child, timeoutMs, input);
   }
 }
 
@@ -388,6 +387,7 @@ function collectHiddenJson(
   boundary: HiddenChildProcessBoundary,
   child: OwnedHiddenChildProcess,
   timeoutMs: number | undefined,
+  input: unknown,
 ): Promise<unknown> {
   return new Promise((resolveResult, rejectResult) => {
     let settled = false;
@@ -450,6 +450,16 @@ function collectHiddenJson(
         );
       } else finish();
     });
+    const stdinFailure = (cause: unknown) => {
+      finish(boundaryError("OWNED_PROCESS_BOUNDARY_UNVERIFIABLE:probe stdin", {}, cause));
+    };
+    // Keep this listener after settlement: a queued pipe error may arrive after close/timeout.
+    child.stdin?.on("error", stdinFailure);
+    try {
+      child.stdin?.end(JSON.stringify(input), "utf8");
+    } catch (cause) {
+      stdinFailure(cause);
+    }
   });
 }
 

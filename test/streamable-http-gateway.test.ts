@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { request as httpRequest, Server as NodeHttpServer, type ServerResponse } from "node:http";
+import {
+  request as httpRequest,
+  type IncomingMessage,
+  Server as NodeHttpServer,
+  type ServerResponse,
+} from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -429,6 +434,204 @@ describe("StreamableHttpGateway", () => {
     response.emit("drain");
     await expect(writing).resolves.toBe(true);
     expect(response.write).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["accepted write", "backpressure", "queued end"] as const)(
+    "contains asynchronous response EPIPE from %s while native work remains in flight",
+    async (failureMode) => {
+      const fixture = fakeAppServer();
+      const scheduler = new RecordingRequestContextScheduler();
+      const observations: StreamableHttpGatewayRequestObservation[] = [];
+      const nativeCompleted = vi.fn();
+      const appServer: AppServerRpcClient = {
+        request: async <T>(method: string, params?: unknown): Promise<T> => {
+          const result = await fixture.appServer.request<T>(method, params);
+          if (method === "mcpServer/tool/call") nativeCompleted();
+          return result;
+        },
+      };
+      const gateway = gatewayFor(appServer, {
+        scheduler,
+        observeMcpRequest: (observation) => {
+          observations.push(observation);
+        },
+      });
+      let failedResponse: ServerResponse | undefined;
+      const nativeEmit = NodeHttpServer.prototype.emit;
+      const emitSpy = vi.spyOn(NodeHttpServer.prototype, "emit").mockImplementation(function (
+        this: NodeHttpServer,
+        event: string | symbol,
+        ...args: unknown[]
+      ) {
+        if (event === "request") {
+          const request = args[0] as IncomingMessage;
+          if (request.headers["x-test-response-epipe"] === "true") {
+            failedResponse = args[1] as ServerResponse;
+          }
+        }
+        return nativeEmit.call(this, event, ...args);
+      });
+      const address = await gateway.start();
+      const url = `http://${address.host}:${address.port}${address.fullPath}`;
+      const abort = new AbortController();
+      const client = new ModernMcpClient(
+        { name: "response-epipe", version: "1.0.0" },
+        { capabilities: {}, versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      );
+      try {
+        await client.connect(
+          new ModernStreamableHTTPClientTransport(new URL(url), {
+            requestInit: {
+              headers: { Authorization: "Bearer owner", "x-test-response-epipe": "true" },
+            },
+          }),
+        );
+        observations.length = 0;
+        const exchange = client
+          .callTool(
+            {
+              name: "slow",
+              arguments: { omnicodexInvocationId: "10000000-0000-4000-8000-000000000992" },
+            },
+            { signal: abort.signal },
+          )
+          .catch((error: unknown) => error);
+        await fixture.slowStarted;
+        const response = failedResponse;
+        if (response === undefined) throw new Error("Missing real gateway ServerResponse");
+        expect(response.listenerCount("error")).toBeGreaterThan(0);
+        expect(gateway.runtimeStatus.activeMcpRequests).toBe(1);
+        const activeContext = scheduler.contexts.at(-1);
+        expect(activeContext?.transportDisconnectSignal?.aborted).toBe(false);
+        const cause = Object.assign(new Error("write EPIPE"), { code: "EPIPE", syscall: "write" });
+        let emitFailure!: () => void;
+        const errorEmitted = new Promise<void>((resolve) => {
+          emitFailure = () => {
+            setImmediate(() => {
+              response.emit("error", cause);
+              resolve();
+            });
+          };
+        });
+        if (failureMode === "queued end") {
+          // Model end() queued to a broken socket: writableEnded is true, but
+          // finish has not fired. Node reports the write failure asynchronously.
+          vi.spyOn(response, "end").mockImplementation(() => {
+            Object.defineProperty(response, "writableEnded", { configurable: true, value: true });
+            emitFailure();
+            return response;
+          });
+          response.end();
+          expect(response.writableFinished).toBe(false);
+          await errorEmitted;
+        } else {
+          response.setHeader("Content-Type", "text/event-stream");
+          if (failureMode === "backpressure") {
+            const nativeWrite = response.write;
+            Object.defineProperty(response, "writableNeedDrain", {
+              configurable: true,
+              value: true,
+            });
+            vi.spyOn(response, "write").mockImplementation((chunk: string | Uint8Array) => {
+              nativeWrite.call(response, chunk, "utf8");
+              return false;
+            });
+          }
+          const writing = writeServerResponseWithBackpressure(
+            response,
+            ": pending native work\n\n",
+          );
+          const outcome = writing.catch((error: unknown) => error);
+          if (failureMode === "accepted write") await expect(writing).resolves.toBe(true);
+          emitFailure();
+          await errorEmitted;
+          if (failureMode === "backpressure") expect(await outcome).toBe(cause);
+        }
+        await vi.waitFor(() => {
+          expect(response.destroyed).toBe(true);
+          expect(gateway.runtimeStatus.activeMcpRequests).toBe(0);
+          expect(activeContext?.transportDisconnectSignal?.aborted).toBe(true);
+        });
+        // The client may wait to reconnect an SSE stream; retire that waiter
+        // only after independently proving server-side containment.
+        abort.abort();
+        expect(await exchange).toBeInstanceOf(Error);
+        expect(nativeCompleted).not.toHaveBeenCalled();
+        expect(observations).toHaveLength(1);
+        expect(observations[0]).toMatchObject({
+          status: 0,
+          responseTermination: "close_before_finish",
+        });
+        expect(() => {
+          response.emit("error", cause);
+          response.emit("error", cause);
+        }).not.toThrow();
+
+        // Only delivery was lost. A separate request still works, and native
+        // settlement is neither forged nor automatically retried by containment.
+        await expect(
+          fetch(
+            `http://${address.host}:${address.port}/.well-known/oauth-protected-resource/native`,
+          ),
+        ).resolves.toMatchObject({ status: 200 });
+        fixture.releaseSlow();
+        await vi.waitFor(() => expect(nativeCompleted).toHaveBeenCalledTimes(1));
+        expect(fixture.calls.filter((method) => method === "mcpServer/tool/call")).toHaveLength(1);
+        expect(gateway.runtimeStatus.activeMcpRequests).toBe(0);
+        expect(observations).toHaveLength(1);
+      } finally {
+        fixture.releaseSlow();
+        abort.abort();
+        emitSpy.mockRestore();
+        await client.close().catch(() => undefined);
+        await gateway.stop(1_000);
+      }
+    },
+  );
+
+  it("installs response containment before an early authorization end and keeps late errors handled", async () => {
+    const gateway = gatewayFor(fakeAppServer().appServer);
+    let failedResponse: ServerResponse | undefined;
+    let listenerCountBeforeEnd = 0;
+    const nativeEmit = NodeHttpServer.prototype.emit;
+    const emitSpy = vi.spyOn(NodeHttpServer.prototype, "emit").mockImplementation(function (
+      this: NodeHttpServer,
+      event: string | symbol,
+      ...args: unknown[]
+    ) {
+      if (event === "request") {
+        const response = args[1] as ServerResponse;
+        failedResponse = response;
+        const nativeEnd = response.end;
+        vi.spyOn(response, "end").mockImplementation(
+          (...endArgs: Parameters<typeof response.end>) => {
+            listenerCountBeforeEnd = response.listenerCount("error");
+            const result = nativeEnd.apply(response, endArgs);
+            setImmediate(() =>
+              response.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })),
+            );
+            return result;
+          },
+        );
+      }
+      return nativeEmit.call(this, event, ...args);
+    });
+    const address = await gateway.start();
+    try {
+      const result = await fetch(`http://${address.host}:${address.port}${address.fullPath}`)
+        .then((response) => response.text())
+        .catch((error: unknown) => error);
+      expect(result).toBeDefined();
+      expect(listenerCountBeforeEnd).toBeGreaterThan(0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const response = failedResponse;
+      if (response === undefined) throw new Error("Missing early gateway response");
+      expect(() => response.emit("error", new Error("late response error"))).not.toThrow();
+      expect(response.destroyed).toBe(true);
+    } finally {
+      emitSpy.mockRestore();
+      await gateway.stop();
+    }
   });
 
   it("releases a finite POST after its terminal HTTP response even if the SDK handler stays pending", async () => {

@@ -314,8 +314,7 @@ export class CodexDesktopLifecycleController implements CodexDesktopLifecycleCon
       },
     );
     if (child.stdin === null) throw new Error("CODEX_DESKTOP_LIFECYCLE_STDIN_UNAVAILABLE");
-    child.stdin.end(JSON.stringify(input), "utf8");
-    return collectPowerShellJson<T>(this.#childProcesses, child, boundary);
+    return collectPowerShellJson<T>(this.#childProcesses, child, boundary, input);
   }
 }
 
@@ -449,6 +448,7 @@ function collectPowerShellJson<T>(
   boundaryOwner: HiddenChildProcessBoundary,
   child: OwnedHiddenChildProcess,
   boundary: CodexDesktopLifecycleBoundary,
+  input: unknown,
 ): Promise<T> {
   return new Promise<T>((resolveResult, rejectResult) => {
     let settled = false;
@@ -500,6 +500,11 @@ function collectPowerShellJson<T>(
           new Error(`CODEX_DESKTOP_LIFECYCLE_HELPER_FAILED:${String(code)}:${String(closeSignal)}`),
         );
     });
+    const stdinFailure = (cause: unknown) => {
+      finish(new Error("CODEX_DESKTOP_LIFECYCLE_HELPER_STDIN_FAILED", { cause }));
+    };
+    // Retain across close/abort/deadline so late pipe errors stay local to this helper.
+    child.stdin?.on("error", stdinFailure);
     if (signal?.aborted) {
       abort();
       return;
@@ -507,6 +512,11 @@ function collectPowerShellJson<T>(
     signal?.addEventListener("abort", abort, { once: true });
     if (boundary.deadlineUnixMs !== undefined) {
       timer = setTimeout(abort, Math.max(1, boundary.deadlineUnixMs - Date.now()));
+    }
+    try {
+      child.stdin?.end(JSON.stringify(input), "utf8");
+    } catch (cause) {
+      stdinFailure(cause);
     }
   });
 }

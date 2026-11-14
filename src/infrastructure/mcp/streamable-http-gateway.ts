@@ -1017,6 +1017,13 @@ export class StreamableHttpGateway {
     let useEphemeralFallback = requestedPort === 0;
     for (let attempt = 0; attempt < bindAttempts; attempt += 1) {
       const server = createServer((request, response) => {
+        // write()/end() can emit asynchronously even without backpressure. Keep
+        // containment for this response's lifetime, including late errors after
+        // finish/close. Lost delivery says nothing about native settlement: do
+        // not retry the call or retire its session/executors here.
+        response.on("error", () => {
+          if (!response.destroyed) response.destroy();
+        });
         void this.#handle(request, response).catch(() => {
           if (response.destroyed || response.writableEnded) return;
           if (response.headersSent) {
@@ -2360,7 +2367,7 @@ export class StreamableHttpGateway {
     };
     response.once("finish", () => observe(response.statusCode, "response_finished", "finish"));
     response.once("close", () => {
-      if (!response.writableEnded) observe(0, "connection_closed", "close_before_finish");
+      if (!response.writableFinished) observe(0, "connection_closed", "close_before_finish");
     });
   }
 
@@ -3672,7 +3679,7 @@ function transportDisconnectBoundary(
 ): { readonly signal: AbortSignal; readonly clear: () => void } {
   const controller = new AbortController();
   const abort = (): void => {
-    if (response.writableEnded || controller.signal.aborted) return;
+    if (response.writableFinished || controller.signal.aborted) return;
     controller.abort(new Error("MCP response connection closed"));
   };
   const clear = (): void => {

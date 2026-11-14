@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexDesktopLifecycleController } from "../src/infrastructure/windows/codex-desktop-lifecycle-controller.js";
 import { HiddenChildProcessBoundary } from "../src/infrastructure/windows/hidden-child-process.js";
@@ -60,6 +60,96 @@ describe("CodexDesktopLifecycleController", () => {
         appUserModelId: stopped.appUserModelId,
         enableChatEvents: true,
       });
+    },
+  );
+
+  it.skipIf(process.platform !== "win32").each(["async write", "synchronous end"] as const)(
+    "contains lifecycle stdin EPIPE from %s without killing or resettling the helper",
+    async (failureMode) => {
+      const cause = Object.assign(new Error("write EPIPE"), { code: "EPIPE", syscall: "write" });
+      const stdin = new Writable({
+        write(_chunk, _encoding, callback) {
+          expect(this.listenerCount("error")).toBeGreaterThan(0);
+          setImmediate(() => callback(cause));
+        },
+      });
+      if (failureMode === "synchronous end") {
+        vi.spyOn(stdin, "end").mockImplementation(() => {
+          expect(stdin.listenerCount("error")).toBeGreaterThan(0);
+          throw cause;
+        });
+      }
+      const child = lifecycleChild(stdin);
+      const controller = new CodexDesktopLifecycleController({
+        systemRoot: "C:\\Windows",
+        childProcesses: new HiddenChildProcessBoundary(() => child as never),
+      });
+      const abort = new AbortController();
+      const resolved = vi.fn();
+      const rejected = vi.fn((error: unknown) => error);
+      const result = controller
+        .status({ signal: abort.signal, timeoutMs: 1_000 })
+        .then(resolved, rejected);
+
+      const error = await result;
+      expect(error).toMatchObject({
+        message: "CODEX_DESKTOP_LIFECYCLE_HELPER_STDIN_FAILED",
+        cause,
+        stdout: "",
+        stderr: "",
+      });
+      expect((error as Error).cause).toBe(cause);
+      abort.abort();
+      child.stdout.end("null");
+      child.emit("close", 0, null);
+      expect(() => {
+        stdin.emit("error", cause);
+        stdin.emit("error", cause);
+        child.emit("error", new Error("late helper error"));
+      }).not.toThrow();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(resolved).not.toHaveBeenCalled();
+      expect(rejected).toHaveBeenCalledTimes(1);
+      expect(child.kill).not.toHaveBeenCalled();
+    },
+  );
+
+  it.skipIf(process.platform !== "win32").each(["close", "abort", "deadline"] as const)(
+    "keeps late lifecycle stdin errors handled after %s",
+    async (firstEvent) => {
+      vi.useFakeTimers();
+      try {
+        const child = lifecycleChild(new PassThrough());
+        const controller = new CodexDesktopLifecycleController({
+          systemRoot: "C:\\Windows",
+          childProcesses: new HiddenChildProcessBoundary(() => child as never),
+        });
+        const abort = new AbortController();
+        const settled = vi.fn((value: unknown) => value);
+        const result = controller
+          .status({ signal: abort.signal, timeoutMs: 10 })
+          .then(settled, settled);
+        if (firstEvent === "close") {
+          child.stdout.end("null");
+          child.emit("close", 0, null);
+        } else if (firstEvent === "abort") abort.abort(new Error("caller cancelled"));
+        else await vi.advanceTimersByTimeAsync(10);
+        const value = await result;
+        if (firstEvent === "close") expect(value).toMatchObject({ installed: false });
+        else expect(value).toBeInstanceOf(Error);
+        expect(() => {
+          child.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+          child.stdin.emit("error", new Error("late pipe error"));
+        }).not.toThrow();
+        child.emit("close", 7, null);
+        abort.abort();
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(settled).toHaveBeenCalledTimes(1);
+        expect(child.kill).toHaveBeenCalledTimes(firstEvent === "close" ? 0 : 1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
     },
   );
 
@@ -146,3 +236,15 @@ describe("CodexDesktopLifecycleController", () => {
     expect(order).toEqual(["launch-start", "launch-end", "second-complete"]);
   });
 });
+
+function lifecycleChild(stdin: Writable) {
+  return Object.assign(new EventEmitter(), {
+    pid: 9234,
+    exitCode: null,
+    signalCode: null,
+    stdin,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: vi.fn(() => true),
+  });
+}
