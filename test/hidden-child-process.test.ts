@@ -199,6 +199,38 @@ describe("HiddenChildProcessBoundary", () => {
   );
 
   it.skipIf(process.platform !== "win32")(
+    "recognizes a PID reused by a different image before reading protected process metadata",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "omnicodex-reused-pid-probe-"));
+      try {
+        const boundary = new HiddenChildProcessBoundary(
+          undefined,
+          join(directory, "actions.jsonl"),
+        );
+        await expect(
+          boundary.inspectWindowsProcess(process.pid, {
+            expectedProcessName: "not-the-current-node.exe",
+            timeoutMs: 10_000,
+          }),
+        ).resolves.toBeUndefined();
+        await expect(
+          boundary.inspectWindowsProcess(process.pid, {
+            expectedProcessName: "node.exe",
+            timeoutMs: 10_000,
+          }),
+        ).resolves.toMatchObject({ pid: process.pid, name: "node.exe" });
+        await expect(
+          boundary.inspectWindowsProcess(process.pid, {
+            expectedProcessName: "../node.exe",
+          }),
+        ).rejects.toThrow("expected process name");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
     "does not impose an inspection timeout when the caller omits one",
     async () => {
       vi.useFakeTimers();

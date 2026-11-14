@@ -17,7 +17,10 @@ import {
 } from "./hidden-child-process.js";
 
 export interface RecoveredWindowsProcessBoundary {
-  inspectWindowsProcess(pid: number): Promise<RecoveredWindowsProcessIdentity | undefined>;
+  inspectWindowsProcess(
+    pid: number,
+    options?: { readonly expectedProcessName?: string },
+  ): Promise<RecoveredWindowsProcessIdentity | undefined>;
   terminateExactRecoveredWindowsProcess(
     expected: RecoveredWindowsProcessIdentity,
   ): Promise<"terminated" | "absent" | "changed">;
@@ -102,7 +105,9 @@ export class WindowsStaleCodexAppServerReclaimer {
     const deadline = Date.now() + this.#naturalExitWaitMs;
     do {
       for (const [nonce, entry] of pending) {
-        const observed = await this.#boundary.inspectWindowsProcess(entry.record.pid);
+        const observed = await this.#boundary.inspectWindowsProcess(entry.record.pid, {
+          expectedProcessName: entry.record.processName,
+        });
         if (observed === undefined) {
           await removeExactRecord(entry.path, entry.record);
           pending.delete(nonce);
@@ -117,7 +122,9 @@ export class WindowsStaleCodexAppServerReclaimer {
 
     let terminatedCount = 0;
     for (const [nonce, entry] of pending) {
-      const observed = await this.#boundary.inspectWindowsProcess(entry.record.pid);
+      const observed = await this.#boundary.inspectWindowsProcess(entry.record.pid, {
+        expectedProcessName: entry.record.processName,
+      });
       if (observed === undefined) {
         await removeExactRecord(entry.path, entry.record);
         pending.delete(nonce);
@@ -129,7 +136,9 @@ export class WindowsStaleCodexAppServerReclaimer {
       if (outcome === "changed") {
         throw new Error("OWNED_CODEX_APP_SERVER_IDENTITY_CHANGED:termination fence");
       }
-      const after = await this.#boundary.inspectWindowsProcess(entry.record.pid);
+      const after = await this.#boundary.inspectWindowsProcess(entry.record.pid, {
+        expectedProcessName: entry.record.processName,
+      });
       if (after !== undefined) {
         throw new Error("OWNED_CODEX_APP_SERVER_TERMINATION_UNCONFIRMED:process remains");
       }

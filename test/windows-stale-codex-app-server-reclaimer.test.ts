@@ -65,6 +65,7 @@ describe("WindowsStaleCodexAppServerReclaimer", () => {
       terminatedCount: 0,
     });
     expect(boundary.terminated).toHaveLength(0);
+    expect(boundary.expectedNames).toEqual(["codex.exe"]);
     await expect(access(fixture.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -88,12 +89,17 @@ describe("WindowsStaleCodexAppServerReclaimer", () => {
 class SequenceBoundary implements RecoveredWindowsProcessBoundary {
   readonly #values: Array<RecoveredWindowsProcessIdentity | undefined>;
   readonly terminated: RecoveredWindowsProcessIdentity[] = [];
+  readonly expectedNames: string[] = [];
 
   constructor(values: Array<RecoveredWindowsProcessIdentity | undefined>) {
     this.#values = values;
   }
 
-  async inspectWindowsProcess(): Promise<RecoveredWindowsProcessIdentity | undefined> {
+  async inspectWindowsProcess(
+    _pid: number,
+    options?: { readonly expectedProcessName?: string },
+  ): Promise<RecoveredWindowsProcessIdentity | undefined> {
+    this.expectedNames.push(options?.expectedProcessName ?? "");
     return this.#values.shift();
   }
 

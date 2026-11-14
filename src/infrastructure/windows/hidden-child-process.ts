@@ -37,6 +37,8 @@ export interface RecoveredWindowsProcessIdentity {
 export interface WindowsProcessBoundaryOptions {
   readonly systemRoot?: string;
   readonly timeoutMs?: number;
+  /** A different observed image name proves that the recorded child PID was reused. */
+  readonly expectedProcessName?: string;
 }
 
 /**
@@ -197,9 +199,15 @@ export class HiddenChildProcessBoundary {
     pid: number,
     options: WindowsProcessBoundaryOptions = {},
   ): Promise<RecoveredWindowsProcessIdentity | undefined> {
+    if (
+      options.expectedProcessName !== undefined &&
+      !/^[a-z0-9._-]+\.exe$/iu.test(options.expectedProcessName)
+    ) {
+      throw new Error("OWNED_PROCESS_BOUNDARY_UNVERIFIABLE:expected process name");
+    }
     const result = await this.#runWindowsProcessCommand(
       windowsProcessInspectionScript,
-      { pid },
+      { pid, expectedProcessName: options.expectedProcessName ?? null },
       options,
     );
     if (!isObject(result) || (result.status !== "absent" && result.status !== "observed")) {
@@ -487,6 +495,10 @@ const windowsProcessInspectionScript = [
   "$targetPid = [int]$request.pid",
   '$cim = Get-CimInstance Win32_Process -Filter "ProcessId = $targetPid" -ErrorAction SilentlyContinue',
   "if ($null -eq $cim) {",
+  '  [Console]::Out.Write(\'{"status":"absent"}\')',
+  "  exit 0",
+  "}",
+  "if ($null -ne $request.expectedProcessName -and [string]$cim.Name -ine [string]$request.expectedProcessName) {",
   '  [Console]::Out.Write(\'{"status":"absent"}\')',
   "  exit 0",
   "}",
