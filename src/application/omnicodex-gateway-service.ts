@@ -3371,8 +3371,8 @@ export class OmniCodexGatewayService {
     if (this.#options.prepareRuntime !== undefined) {
       return this.#options.prepareRuntime(candidate, options);
     }
-    // Keep discovery identity for the follower/switch, but use this one complete
-    // package for every owned child, including lazy per-work-session contexts.
+    // Desktop pipe connections must validate the selected physical executable.
+    // Only owned children use this complete snapshot, including lazy Responses contexts.
     const pinnedCandidate = await snapshotManagedCodexRuntime(
       candidate,
       join(omniCodexDataDirectory(), "engine-generations"),
@@ -3421,7 +3421,7 @@ export class OmniCodexGatewayService {
     let primary: RestartableCodexAppServerProcess | undefined;
     let operatorResponsesLease: SharedResponsesLease | undefined;
     let ownedBrowserNativeExecutor: BrowserNativeExecutor | undefined;
-    const detachedThreads = new CodexDetachedThreadClient(pinnedCandidate, {
+    const detachedThreads = new CodexDetachedThreadClient(candidate, {
       createProcess: (runtime, processOptions) =>
         new CodexAppServerConnection(runtime, processOptions),
       ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
@@ -3455,7 +3455,7 @@ export class OmniCodexGatewayService {
         },
         (runtime, processOptions) => new CodexAppServerProcess(runtime, processOptions),
       );
-      primary = new RestartableCodexAppServerProcess(pinnedCandidate, {
+      primary = new RestartableCodexAppServerProcess(candidate, {
         processFactory: (runtime, processOptions) =>
           new CodexAppServerConnection(runtime, processOptions),
         ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
@@ -3718,7 +3718,7 @@ export class OmniCodexGatewayService {
         const operation = (async () => {
           // A separate pipe connection keeps inventory requests independent
           // of long native calls without creating another App Server process.
-          const reader = new CodexAppServerConnection(pinnedCandidate, {
+          const reader = new CodexAppServerConnection(candidate, {
             ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
             onServerRequest: answerAppServerApprovalRequest,
             onNotification: (message) => this.#options.onDiagnostic?.(message),
@@ -3750,9 +3750,9 @@ export class OmniCodexGatewayService {
       const reconcileBridge = async () =>
         bridgeThreadContext.accept(
           await new OmniCodexBridgeReconciler({
-            candidate: pinnedCandidate,
+            candidate,
             dynamicTools: OMNICODEX_BRIDGE_CONTEXT_TOOLS,
-            bootstrapFactory: () => new CodexAppServerConnection(pinnedCandidate),
+            bootstrapFactory: () => new CodexAppServerConnection(candidate),
             ownerInspector: desktopIpc,
             threadLifecycle: createBridgeThreadLifecycle(ownedHostTools),
             env: runtimeEnvironment ?? {},
@@ -3830,7 +3830,7 @@ export class OmniCodexGatewayService {
         createNativeRuntime: (context, creationSignal) =>
           createDisposableNativeAppServerContext(
             {
-              candidate: pinnedCandidate,
+              candidate,
               processFactory: (runtime, processOptions) =>
                 new CodexAppServerConnection(runtime, processOptions),
               processOptions: {

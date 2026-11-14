@@ -284,7 +284,7 @@ describe("OmniCodex session executor pool", () => {
     );
     expect(serviceSource).not.toContain("OMNICODEX_DURABLE_RESPONSES_RUNTIME_IDLE_MS");
     expect(serviceSource).toMatch(/new SharedResponsesAppServer\(\s*pinnedCandidate,/);
-    expect(serviceSource).toContain("new RestartableCodexAppServerProcess(pinnedCandidate, {");
+    expect(serviceSource).toContain("new RestartableCodexAppServerProcess(candidate, {");
     expect(serviceSource).toContain(
       "(runtime, processOptions) => new CodexAppServerProcess(runtime, processOptions)",
     );
