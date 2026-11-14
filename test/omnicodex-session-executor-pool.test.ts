@@ -283,7 +283,8 @@ describe("OmniCodex session executor pool", () => {
       "nativeContextIdleMs: OMNICODEX_DURABLE_NATIVE_CONTEXT_IDLE_MS,",
     );
     expect(serviceSource).not.toContain("OMNICODEX_DURABLE_RESPONSES_RUNTIME_IDLE_MS");
-    expect(serviceSource).toMatch(/new SharedResponsesAppServer\(\s*candidate,/);
+    expect(serviceSource).toMatch(/new SharedResponsesAppServer\(\s*pinnedCandidate,/);
+    expect(serviceSource).toContain("new RestartableCodexAppServerProcess(pinnedCandidate, {");
     expect(serviceSource).toContain(
       "(runtime, processOptions) => new CodexAppServerProcess(runtime, processOptions)",
     );
