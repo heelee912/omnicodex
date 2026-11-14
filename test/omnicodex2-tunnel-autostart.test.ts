@@ -9,13 +9,21 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+const { spawnMock, terminateMock } = vi.hoisted(() => ({
+  spawnMock: vi.fn(),
+  terminateMock: vi.fn(),
+}));
 vi.mock("../src/infrastructure/windows/hidden-child-process.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   spawnHidden: spawnMock,
+  terminateOwnedHiddenChild: terminateMock,
 }));
 
-import { ensureConfiguredOmniCodex2Tunnel } from "../src/cli.js";
+import {
+  ensureConfiguredOmniCodex2Tunnel,
+  superviseConfiguredOmniCodex2Tunnel,
+} from "../src/cli.js";
+import type { OmniCodexDaemonState } from "../src/infrastructure/config/omnicodex-config-store.js";
 
 const scriptPath = fileURLToPath(
   new URL("../scripts/windows/start-omnicodex2-tunnel.ps1", import.meta.url),
@@ -46,6 +54,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   spawnMock.mockReset();
+  terminateMock.mockReset();
+  vi.useRealTimers();
   vi.unstubAllEnvs();
   await rm(root, { recursive: true, force: true });
 });
@@ -78,7 +88,7 @@ describe("configured omnicodex2 scheduled startup", () => {
       ],
       expect.objectContaining({
         env: expect.objectContaining({ OMNICODEX_DATA_DIR: dataDirectory }),
-        stdio: ["ignore", "ignore", "pipe"],
+        stdio: ["ignore", "ignore", "ignore"],
       }),
     );
     const packageJson = JSON.parse(
@@ -106,25 +116,29 @@ describe("configured omnicodex2 scheduled startup", () => {
     expect(spawnMock.mock.calls[0]?.[1]).not.toContain(packagedDirectory);
   });
 
-  it("records the actual failure while allowing daemon supervision to continue", async () => {
+  it("records only a bounded reason code, never child output or credentials", async () => {
     await writeFile(profilePath, "{}");
-    mockChildExit(1, "Required runtime file is missing: tunnel-client.exe");
+    mockChildExit(1, "secret-runtime-key Authorization: Bearer secret-token");
     await expect(ensureConfiguredOmniCodex2Tunnel()).resolves.toBeUndefined();
-    const entry = JSON.parse(await readFile(join(dataDirectory, "operations.jsonl"), "utf8"));
+    const contents = await readFile(join(dataDirectory, "operations.jsonl"), "utf8");
+    const entry = JSON.parse(contents);
     expect(entry.event).toBe("external_tunnel_start_failed");
     expect(entry.details).toEqual({
       alias: "omnicodex2",
       source: "scheduled-task",
-      error:
-        "omnicodex2 tunnel startup failed (exit 1, signal null): Required runtime file is missing: tunnel-client.exe",
+      reasonCode: "COMMAND_FAILED",
     });
+    expect(contents).not.toContain("secret-");
+    await ensureConfiguredOmniCodex2Tunnel();
+    expect(
+      (await readFile(join(dataDirectory, "operations.jsonl"), "utf8")).trim().split("\n"),
+    ).toHaveLength(1);
     const cliSource = await readFile(new URL("../src/cli.ts", import.meta.url), "utf8");
     const supervisor = cliSource.slice(
       cliSource.indexOf("async function superviseScheduledTaskDaemon("),
+      cliSource.indexOf("interface DaemonControlResponse"),
     );
-    expect(supervisor.indexOf("await ensureConfiguredOmniCodex2Tunnel();")).toBeLessThan(
-      supervisor.indexOf("await waitForExactDaemonProcessExit(state);"),
-    );
+    expect(supervisor).toContain("await superviseConfiguredOmniCodex2Tunnel(state);");
   });
 
   it("records a spawn error without ending daemon supervision", async () => {
@@ -136,9 +150,266 @@ describe("configured omnicodex2 scheduled startup", () => {
     });
     await expect(ensureConfiguredOmniCodex2Tunnel()).resolves.toBeUndefined();
     const entry = JSON.parse(await readFile(join(dataDirectory, "operations.jsonl"), "utf8"));
-    expect(entry.details.error).toBe("spawn powershell.exe ENOENT");
+    expect(entry.details.reasonCode).toBe("START_FAILED");
   });
 });
+
+describe("exact-daemon tunnel maintenance", () => {
+  it("rechecks the official idempotent path after port 5367 changes to 12595 on the same PID", async () => {
+    vi.useFakeTimers();
+    const fixture = supervisorFixture();
+    const targets: number[] = [];
+    fixture.dependencies.ensure.mockImplementation(async (options) => {
+      if (await options?.canStart?.()) targets.push(fixture.current.address?.port ?? 0);
+    });
+    const supervision = superviseConfiguredOmniCodex2Tunnel(fixture.expected, fixture.dependencies);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(targets).toEqual([5367]);
+    fixture.current = {
+      ...fixture.current,
+      address: { ...fixture.expected.address, port: 12595 },
+    };
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(targets).toEqual([5367, 12595]);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(targets).toEqual([5367, 12595, 12595]);
+    fixture.dependencies.probe.mockReturnValue("absent");
+    await vi.advanceTimersByTimeAsync(250);
+    await supervision;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(targets).toHaveLength(3);
+  });
+
+  it("never overlaps an in-flight check and cancels it when the exact daemon exits", async () => {
+    vi.useFakeTimers();
+    const fixture = supervisorFixture();
+    let finish: (() => void) | undefined;
+    let signal: AbortSignal | undefined;
+    fixture.dependencies.ensure.mockImplementation((options) => {
+      signal = options?.signal;
+      return new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const supervision = superviseConfiguredOmniCodex2Tunnel(fixture.expected, fixture.dependencies);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(fixture.dependencies.ensure).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(false);
+    fixture.dependencies.probe.mockReturnValue("absent");
+    await vi.advanceTimersByTimeAsync(250);
+    await supervision;
+    expect(signal?.aborted).toBe(true);
+    finish?.();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fixture.dependencies.ensure).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels stale-target work during a switch and waits for its completion before rechecking", async () => {
+    vi.useFakeTimers();
+    const fixture = supervisorFixture();
+    let finish: (() => void) | undefined;
+    let signal: AbortSignal | undefined;
+    fixture.dependencies.ensure.mockImplementationOnce((options) => {
+      signal = options?.signal;
+      return new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const supervision = superviseConfiguredOmniCodex2Tunnel(fixture.expected, fixture.dependencies);
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.current = { ...fixture.current, lifecycle: "switching" };
+    await vi.advanceTimersByTimeAsync(250);
+    expect(signal?.aborted).toBe(true);
+    fixture.current = {
+      ...fixture.current,
+      lifecycle: "ready",
+      address: { ...fixture.expected.address, port: 12595 },
+    };
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fixture.dependencies.ensure).toHaveBeenCalledTimes(1);
+    finish?.();
+    await vi.advanceTimersByTimeAsync(15_250);
+    expect(fixture.dependencies.ensure).toHaveBeenCalledTimes(2);
+    fixture.dependencies.probe.mockReturnValue("absent");
+    await vi.advanceTimersByTimeAsync(250);
+    await supervision;
+  });
+
+  it.each([
+    { pid: 10133 },
+    { instanceNonce: "replacement-nonce" },
+    { startedAtUnixMs: 2000 },
+    { controlToken: "replacement-control-token" },
+  ])("refuses a mismatched exact daemon identity: %j", async (replacement) => {
+    const fixture = supervisorFixture();
+    fixture.current = { ...fixture.current, ...replacement };
+    await superviseConfiguredOmniCodex2Tunnel(fixture.expected, fixture.dependencies);
+    expect(fixture.dependencies.status).not.toHaveBeenCalled();
+    expect(fixture.dependencies.ensure).not.toHaveBeenCalled();
+  });
+
+  it("does not rebind on a late ownership response after replacement", async () => {
+    vi.useFakeTimers();
+    const fixture = supervisorFixture();
+    let finish: ((value: { lifecycle: OmniCodexDaemonState["lifecycle"] }) => void) | undefined;
+    fixture.dependencies.status.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const supervision = superviseConfiguredOmniCodex2Tunnel(fixture.expected, fixture.dependencies);
+    await vi.advanceTimersByTimeAsync(0);
+    fixture.current = { ...fixture.current, instanceNonce: "replacement-nonce" };
+    await vi.advanceTimersByTimeAsync(250);
+    await supervision;
+    finish?.({ lifecycle: "ready" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fixture.dependencies.ensure).not.toHaveBeenCalled();
+  });
+
+  it("requires authenticated ready status, not just a ready state file", async () => {
+    vi.useFakeTimers();
+    const fixture = supervisorFixture();
+    fixture.dependencies.status.mockRejectedValueOnce(new Error("ownership proof rejected"));
+    fixture.dependencies.status.mockResolvedValueOnce({ lifecycle: "draining" });
+    const supervision = superviseConfiguredOmniCodex2Tunnel(fixture.expected, fixture.dependencies);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(fixture.dependencies.ensure).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(fixture.dependencies.ensure).toHaveBeenCalledTimes(1);
+    fixture.dependencies.probe.mockReturnValue("absent");
+    await vi.advanceTimersByTimeAsync(250);
+    await supervision;
+  });
+
+  it("keeps task ownership through missing state but does no tunnel work without proof", async () => {
+    vi.useFakeTimers();
+    const fixture = supervisorFixture();
+    fixture.dependencies.readState.mockResolvedValue(undefined);
+    let exited = false;
+    const supervision = superviseConfiguredOmniCodex2Tunnel(
+      fixture.expected,
+      fixture.dependencies,
+    ).then(() => {
+      exited = true;
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(exited).toBe(false);
+    expect(fixture.dependencies.status).not.toHaveBeenCalled();
+    expect(fixture.dependencies.ensure).not.toHaveBeenCalled();
+    fixture.dependencies.probe.mockReturnValue("absent");
+    await vi.advanceTimersByTimeAsync(250);
+    await supervision;
+  });
+
+  it("revalidates ownership immediately before spawning after profile discovery", async () => {
+    await writeFile(profilePath, "{}");
+    await ensureConfiguredOmniCodex2Tunnel({ canStart: async () => false });
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("bounds a stuck command and retains serialization until its exact child closes", async () => {
+    await writeFile(profilePath, "{}");
+    vi.useFakeTimers();
+    const child = new EventEmitter();
+    spawnMock.mockReturnValue(child);
+    terminateMock.mockReturnValue(false);
+    const pending = ensureConfiguredOmniCodex2Tunnel();
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+    await ensureConfiguredOmniCodex2Tunnel();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(terminateMock).toHaveBeenCalledExactlyOnceWith(child);
+    await ensureConfiguredOmniCodex2Tunnel();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    child.emit("close", null, "SIGTERM");
+    await pending;
+    const entry = JSON.parse(await readFile(join(dataDirectory, "operations.jsonl"), "utf8"));
+    expect(entry.details.reasonCode).toBe("COMMAND_TIMEOUT");
+    mockChildExit(0);
+    await ensureConfiguredOmniCodex2Tunnel();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not release a live command's guard on signal errors before close", async () => {
+    await writeFile(profilePath, "{}");
+    vi.useFakeTimers();
+    const child = Object.assign(new EventEmitter(), { pid: 4242 });
+    spawnMock.mockReturnValue(child);
+    terminateMock.mockImplementation(() => {
+      child.emit("error", new Error("signal failed with secret diagnostic"));
+      return false;
+    });
+    const pending = ensureConfiguredOmniCodex2Tunnel();
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(30_000);
+    child.emit("error", new Error("another signal error"));
+    await ensureConfiguredOmniCodex2Tunnel();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    child.emit("close", null, "SIGTERM");
+    await pending;
+    expect(await readFile(join(dataDirectory, "operations.jsonl"), "utf8")).not.toContain("secret");
+  });
+
+  it("cancels only the owned command on stop, with no failure log or later reconnect", async () => {
+    await writeFile(profilePath, "{}");
+    vi.useFakeTimers();
+    const child = new EventEmitter();
+    const controller = new AbortController();
+    spawnMock.mockReturnValue(child);
+    terminateMock.mockImplementation((owned) => {
+      expect(owned).toBe(child);
+      queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+      return true;
+    });
+    const pending = ensureConfiguredOmniCodex2Tunnel({ signal: controller.signal });
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    await pending;
+    await ensureConfiguredOmniCodex2Tunnel({ signal: controller.signal });
+    expect(terminateMock).toHaveBeenCalledExactlyOnceWith(child);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    await expect(readFile(join(dataDirectory, "operations.jsonl"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+});
+
+function supervisorFixture() {
+  const expected: OmniCodexDaemonState & {
+    address: NonNullable<OmniCodexDaemonState["address"]>;
+  } = {
+    schemaVersion: 1,
+    lifecycle: "ready",
+    pid: 10132,
+    instanceNonce: "fixture-nonce",
+    startedAtUnixMs: 1000,
+    updatedAtUnixMs: 1000,
+    controlPipe: "fixture-pipe",
+    controlToken: "fixture-control-token",
+    address: { host: "127.0.0.1", port: 5367, path: "/mcp", fullPath: "/mcp/full" },
+  };
+  const fixture = {
+    expected,
+    current: expected,
+    dependencies: {
+      readState: vi.fn<() => Promise<OmniCodexDaemonState | undefined>>(),
+      probe: vi.fn<() => "alive" | "absent">().mockReturnValue("alive"),
+      status: vi
+        .fn<
+          (
+            _state: OmniCodexDaemonState,
+            _signal: AbortSignal,
+          ) => Promise<{ lifecycle: OmniCodexDaemonState["lifecycle"] }>
+        >()
+        .mockResolvedValue({ lifecycle: "ready" }),
+      ensure: vi.fn<typeof ensureConfiguredOmniCodex2Tunnel>().mockResolvedValue(undefined),
+    },
+  };
+  fixture.dependencies.readState.mockImplementation(async () => fixture.current);
+  return fixture;
+}
 
 describe.runIf(process.platform === "win32")("PowerShell tunnel startup", () => {
   it("leaves the same healthy runtime untouched without even requesting OAuth metadata", async () => {
@@ -188,6 +459,21 @@ describe.runIf(process.platform === "win32")("PowerShell tunnel startup", () => 
       const result = await runScript(fixture);
       expect(JSON.parse(result.stdout).readyAtLaunch).toBe(true);
       expect(await readCommands()).toEqual(["status", "stop", "connect"]);
+      const commandArgs = (await readFile(join(root, "command-args.jsonl"), "utf8"))
+        .trim()
+        .split(/\r?\n/u)
+        .map((line) => JSON.parse(line) as string[]);
+      expect(commandArgs[0]).toEqual(["runtimes", "status", "omnicodex2", "--json"]);
+      expect(commandArgs[1]).toEqual(["runtimes", "stop", "omnicodex2", "--json"]);
+      expect(commandArgs[2]).toEqual(
+        expect.arrayContaining(["--alias", "omnicodex2", "--tunnel-id", "tunnel_fixture"]),
+      );
+      expect(await readFile(join(root, "roaming", "tunnel-client", "unrelated.yaml"), "utf8")).toBe(
+        "unrelated-profile-marker",
+      );
+      expect(
+        await readFile(join(dataDirectory, "tunnel-client-private", "runtime.key"), "utf8"),
+      ).toBe("fixture-private-key-content");
       const connectArgs = JSON.parse(
         await readFile(join(root, "connect-args.json"), "utf8"),
       ) as string[];
@@ -221,6 +507,10 @@ async function prepareScriptFixture(
 ): Promise<string> {
   await writeFile(profilePath, JSON.stringify({ control_plane: { tunnel_id: "tunnel_fixture" } }));
   await writeFile(
+    join(root, "roaming", "tunnel-client", "unrelated.yaml"),
+    "unrelated-profile-marker",
+  );
+  await writeFile(
     join(dataDirectory, "tunnel-client-private", "runtime.key"),
     "fixture-private-key-content",
   );
@@ -247,6 +537,7 @@ async function prepareScriptFixture(
     clientPath,
     `$operation = $args[1]
 Add-Content -LiteralPath (Join-Path $env:TUNNEL_TEST_ROOT 'commands.txt') -Value $operation
+Add-Content -LiteralPath (Join-Path $env:TUNNEL_TEST_ROOT 'command-args.jsonl') -Value (ConvertTo-Json -Compress -InputObject @($args))
 switch ($operation) {
     'status' { Get-Content -LiteralPath (Join-Path $env:TUNNEL_TEST_ROOT 'status.json') -Raw }
     'stop' { '{}' }

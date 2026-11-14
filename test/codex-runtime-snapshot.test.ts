@@ -152,3 +152,37 @@ it("uses one staged Desktop generation without copying a second OmniCodex packag
   );
   expect(await readdir(owned)).toHaveLength(1);
 });
+
+it("copies runtime artifacts only, never credentials or adjacent user state", async () => {
+  const { root, source, candidate } = await fixture();
+  await writeFile(join(source, "auth.json"), "secret refresh token");
+  await writeFile(join(source, "config.toml"), "private configuration");
+  await mkdir(join(source, ".codex"));
+  await writeFile(join(source, ".codex", "auth.json"), "another secret");
+  const pinned = await snapshotManagedCodexRuntime(candidate, join(root, "owned"), "win32");
+  expect((await readdir(dirname(pinned.executablePath))).sort()).toEqual([
+    "codex-code-mode-host.exe",
+    "codex-command-runner.exe",
+    "codex-windows-sandbox-setup.exe",
+    "codex.exe",
+    "extra.dll",
+  ]);
+});
+
+it("never repairs an incomplete source with sidecars cached from a different package", async () => {
+  const { root, source, candidate } = await fixture();
+  const owned = join(root, "owned");
+  const first = await snapshotManagedCodexRuntime(candidate, owned, "win32");
+  await unlink(join(source, "codex-code-mode-host.exe"));
+  await writeFile(join(source, "codex-command-runner.exe"), "different generation");
+  await expect(snapshotManagedCodexRuntime(candidate, owned, "win32")).rejects.toThrow(
+    "CODEX_RUNTIME_PACKAGE_INCOMPLETE",
+  );
+  // Already pinned processes can still be restarted without consulting the source.
+  const reused = await snapshotManagedCodexRuntime(first, owned, "win32");
+  expect(reused.executablePath).toBe(first.executablePath);
+  expect(await readdir(owned)).toHaveLength(1);
+  expect(
+    await readFile(join(dirname(first.executablePath), "codex-command-runner.exe"), "utf8"),
+  ).toBe("codex-command-runner.exe");
+});

@@ -130,6 +130,11 @@ vi.mock("../src/application/responses-runtime-executor.js", () => ({
   },
 }));
 
+vi.mock("../src/infrastructure/runtime/codex-runtime-snapshot.js", () => ({
+  snapshotManagedCodexRuntime: async (candidate: RuntimeCandidate) => candidate,
+  CodexRuntimePackageError: class extends Error {},
+}));
+
 vi.mock("../src/infrastructure/runtime/codex-app-server-process.js", () => ({
   CodexAppServerProcess: class CodexAppServerProcess {
     readonly client = {

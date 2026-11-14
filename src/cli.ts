@@ -2578,36 +2578,143 @@ async function waitForExistingDaemon(
   throw new Error("OmniCodex daemon startup timed out");
 }
 
-async function superviseScheduledTaskDaemon(state: OmniCodexDaemonState): Promise<void> {
-  if (process.env.OMNICODEX_AUTOSTART_SOURCE !== "scheduled-task") return;
-  await ensureConfiguredOmniCodex2Tunnel();
-  // The exact PID/start-time/nonce ownership check has already passed before
-  // reaching this boundary. Waiting on that process (with no internal
-  // deadline) makes the scheduled action the long-lived supervisor while still
-  // allowing the authenticated stop/restart paths to end it normally.
-  await waitForExactDaemonProcessExit(state);
-  const terminal = [...(await new OmniCodexOperationalLog().read())]
-    .reverse()
-    .find(
-      (entry) =>
-        entry.pid === state.pid &&
-        Date.parse(entry.timestamp) >= state.startedAtUnixMs &&
-        (entry.event === "daemon_stopped" || entry.event === "daemon_failed"),
-    );
-  if (terminal?.event === "daemon_stopped") return;
-  if (terminal?.event === "daemon_failed") {
-    const detail = typeof terminal.details?.error === "string" ? `: ${terminal.details.error}` : "";
-    throw new Error(`Scheduled OmniCodex daemon failed${detail}`);
-  }
-  // A later Scheduled Task run may recover service availability, but the
-  // failed generation must not be recorded as a successful autostart.
-  throw new Error("Scheduled OmniCodex daemon exited without a terminal lifecycle receipt");
+const OMNICODEX2_TUNNEL_CHECK_INTERVAL_MS = 15_000;
+const OMNICODEX2_TUNNEL_COMMAND_TIMEOUT_MS = 30_000;
+let omniCodex2TunnelFlight: Promise<void> | undefined;
+let lastOmniCodex2TunnelFailure: { directory: string; at: number } | undefined;
+
+interface OmniCodex2TunnelEnsureOptions {
+  readonly signal?: AbortSignal;
+  readonly canStart?: () => Promise<boolean>;
 }
 
-export async function ensureConfiguredOmniCodex2Tunnel(): Promise<void> {
+/** Observe the exact daemon, never adopting a replacement or replaying MCP calls. */
+export async function superviseConfiguredOmniCodex2Tunnel(
+  expected: OmniCodexDaemonState,
+  dependencies: {
+    readonly readState?: () => Promise<OmniCodexDaemonState | undefined>;
+    readonly probe?: (pid: number) => ProcessStatus;
+    readonly status?: (
+      state: OmniCodexDaemonState,
+      signal: AbortSignal,
+    ) => Promise<{ readonly lifecycle: OmniCodexDaemonState["lifecycle"] }>;
+    readonly ensure?: typeof ensureConfiguredOmniCodex2Tunnel;
+  } = {},
+): Promise<void> {
+  const readState = dependencies.readState ?? readOmniCodexDaemonState;
+  const probe = dependencies.probe ?? probeProcessStatus;
+  const status =
+    dependencies.status ??
+    ((state, signal) => requestDaemonControl(state, "status", undefined, undefined, signal));
+  const ensure = dependencies.ensure ?? ensureConfiguredOmniCodex2Tunnel;
+  let nextCheckAt = 0;
+  let flight: { controller: AbortController; target: string } | undefined;
+  try {
+    while (probe(expected.pid) !== "absent") {
+      // Missing/unreadable state is not proof of process exit. Keep the task
+      // alive but fail closed for tunnel work until ownership is provable.
+      const current = await readState().catch(() => undefined);
+      if (current !== undefined && !sameDaemonProcess(current, expected)) return;
+      const target = readyOmniCodex2TunnelTarget(current);
+      if (flight !== undefined && flight.target !== target) flight.controller.abort();
+      if (
+        current !== undefined &&
+        target !== undefined &&
+        flight === undefined &&
+        Date.now() >= nextCheckAt
+      ) {
+        const controller = new AbortController();
+        const active = { controller, target };
+        flight = active;
+        void (async () => {
+          // This is an authenticated, exact PID/nonce/start-time ownership proof,
+          // not trust in the state file or an unauthenticated public health URL.
+          const observation = await status(
+            current,
+            AbortSignal.any([controller.signal, AbortSignal.timeout(2_000)]),
+          );
+          if (observation.lifecycle !== "ready" || controller.signal.aborted) return;
+          await ensure({
+            signal: controller.signal,
+            canStart: async () => {
+              const latest = await readState();
+              return (
+                !controller.signal.aborted &&
+                probe(expected.pid) !== "absent" &&
+                latest !== undefined &&
+                sameDaemonProcess(latest, expected) &&
+                readyOmniCodex2TunnelTarget(latest) === target
+              );
+            },
+          });
+        })()
+          .catch(() => undefined)
+          .finally(() => {
+            if (flight === active) flight = undefined;
+            nextCheckAt = Date.now() + OMNICODEX2_TUNNEL_CHECK_INTERVAL_MS;
+          });
+      }
+      await delay(250);
+    }
+  } finally {
+    // Cancel only our owned PowerShell child, never the daemon or other aliases.
+    flight?.controller.abort();
+  }
+}
+
+function readyOmniCodex2TunnelTarget(state: OmniCodexDaemonState | undefined): string | undefined {
+  const address = state?.address;
+  if (
+    state?.lifecycle !== "ready" ||
+    address === undefined ||
+    !["127.0.0.1", "localhost", "::1"].includes(address.host) ||
+    !Number.isInteger(address.port) ||
+    address.port < 1 ||
+    address.port > 65_535 ||
+    !address.fullPath.startsWith("/")
+  )
+    return undefined;
+  return JSON.stringify([address.host, address.port, address.fullPath]);
+}
+
+export async function ensureConfiguredOmniCodex2Tunnel(
+  options: OmniCodex2TunnelEnsureOptions = {},
+): Promise<void> {
+  if (options.signal?.aborted || omniCodex2TunnelFlight !== undefined) return;
+  const flight = startConfiguredOmniCodex2Tunnel(options);
+  omniCodex2TunnelFlight = flight;
+  try {
+    await flight;
+  } finally {
+    if (omniCodex2TunnelFlight === flight) omniCodex2TunnelFlight = undefined;
+  }
+}
+
+async function recordOmniCodex2TunnelFailure(reasonCode: string): Promise<void> {
+  const directory = omniCodexDataDirectory();
+  const now = Date.now();
+  if (
+    lastOmniCodex2TunnelFailure?.directory === directory &&
+    now - lastOmniCodex2TunnelFailure.at < 60_000
+  )
+    return;
+  lastOmniCodex2TunnelFailure = { directory, at: now };
+  // No child stdout/stderr, profile contents, tokens, or key material in logs.
+  await new OmniCodexOperationalLog()
+    .append("external_tunnel_start_failed", {
+      alias: "omnicodex2",
+      source: "scheduled-task",
+      reasonCode,
+    })
+    .catch(() => undefined);
+}
+
+async function startConfiguredOmniCodex2Tunnel(
+  options: OmniCodex2TunnelEnsureOptions,
+): Promise<void> {
   const appData = process.env.APPDATA;
   if (appData === undefined || appData.length === 0) return;
-  const log = new OmniCodexOperationalLog();
+  let reasonCode = "START_FAILED";
   try {
     let profileDirectory = join(appData, "tunnel-client");
     try {
@@ -2633,6 +2740,9 @@ export async function ensureConfiguredOmniCodex2Tunnel(): Promise<void> {
         throw profileError;
       }
     }
+    if (options.signal?.aborted || (options.canStart !== undefined && !(await options.canStart())))
+      return;
+    if (options.signal?.aborted) return;
     const powershellExecutable = join(
       process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows",
       "System32",
@@ -2658,38 +2768,79 @@ export async function ensureConfiguredOmniCodex2Tunnel(): Promise<void> {
       {
         cwd: CLI_PROJECT_ROOT,
         env: { ...process.env, OMNICODEX_DATA_DIR: omniCodexDataDirectory() },
-        stdio: ["ignore", "ignore", "pipe"],
+        stdio: ["ignore", "ignore", "ignore"],
       },
     );
-    let stderr = "";
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      stderr = `${stderr}${chunk}`.slice(-16_384);
-    });
-    await new Promise<void>((resolveStart, rejectStart) => {
-      child.once("error", rejectStart);
-      child.once("close", (code, signal) => {
-        if (code === 0) resolveStart();
-        else {
-          rejectStart(
-            new Error(
-              `omnicodex2 tunnel startup failed (exit ${code}, signal ${signal}): ${stderr.trim()}`,
-            ),
-          );
-        }
+    const cancel = () => {
+      try {
+        terminateOwnedHiddenChild(child);
+      } catch {
+        // If termination cannot be confirmed, retain the single-flight guard
+        // until close. Never launch a second reconnect over a stuck command.
+      }
+    };
+    let failureReceipt: Promise<void> | undefined;
+    const timeout = setTimeout(() => {
+      reasonCode = "COMMAND_TIMEOUT";
+      failureReceipt ??= recordOmniCodex2TunnelFailure(reasonCode);
+      cancel();
+    }, OMNICODEX2_TUNNEL_COMMAND_TIMEOUT_MS);
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      await new Promise<void>((resolveStart, rejectStart) => {
+        child.on("error", (error) => {
+          if (child.pid === undefined) rejectStart(error);
+          else {
+            // A failed signal can emit error while the process remains alive.
+            // Only close releases serialization for a child that received a PID.
+            if (reasonCode !== "COMMAND_TIMEOUT") reasonCode = "COMMAND_FAILED";
+            if (!options.signal?.aborted)
+              failureReceipt ??= recordOmniCodex2TunnelFailure(reasonCode);
+          }
+        });
+        child.once("close", (code) => {
+          if (code === 0) resolveStart();
+          else {
+            if (reasonCode !== "COMMAND_TIMEOUT") reasonCode = "COMMAND_FAILED";
+            rejectStart(new Error("omnicodex2 tunnel command failed"));
+          }
+        });
+        if (options.signal?.aborted) cancel();
       });
-    });
-  } catch (error) {
-    await log
-      .append("external_tunnel_start_failed", {
-        alias: "omnicodex2",
-        source: "scheduled-task",
-        error: toError(error).message,
-      })
-      .catch((logError: unknown) => {
-        process.stderr.write(`${toError(error).message}\n${toError(logError).message}\n`);
-      });
+    } finally {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", cancel);
+      await failureReceipt;
+    }
+  } catch {
+    if (!options.signal?.aborted) await recordOmniCodex2TunnelFailure(reasonCode);
   }
+}
+
+async function superviseScheduledTaskDaemon(state: OmniCodexDaemonState): Promise<void> {
+  if (process.env.OMNICODEX_AUTOSTART_SOURCE !== "scheduled-task") return;
+  // Retain Task Scheduler ownership while observing only this daemon generation.
+  // The tunnel script's idempotent health/target check must recur after switches.
+  await superviseConfiguredOmniCodex2Tunnel(state);
+  // A state-identity mismatch disables tunnel work; it must not release the
+  // scheduled parent while its originally owned process is still exiting.
+  await waitForExactDaemonProcessExit(state);
+  const terminal = [...(await new OmniCodexOperationalLog().read())]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.pid === state.pid &&
+        Date.parse(entry.timestamp) >= state.startedAtUnixMs &&
+        (entry.event === "daemon_stopped" || entry.event === "daemon_failed"),
+    );
+  if (terminal?.event === "daemon_stopped") return;
+  if (terminal?.event === "daemon_failed") {
+    const detail = typeof terminal.details?.error === "string" ? `: ${terminal.details.error}` : "";
+    throw new Error(`Scheduled OmniCodex daemon failed${detail}`);
+  }
+  // A later Scheduled Task run may recover service availability, but the
+  // failed generation must not be recorded as a successful autostart.
+  throw new Error("Scheduled OmniCodex daemon exited without a terminal lifecycle receipt");
 }
 
 interface DaemonControlResponse {

@@ -51,6 +51,10 @@ import {
   CodexModelMetadataSource,
   type CodexModelMetadataSourceLike,
 } from "../infrastructure/runtime/codex-model-metadata-source.js";
+import {
+  CodexRuntimePackageError,
+  snapshotManagedCodexRuntime,
+} from "../infrastructure/runtime/codex-runtime-snapshot.js";
 import { CodexSchemaBundleLoader } from "../infrastructure/runtime/codex-schema-bundle-loader.js";
 import { CuaPluginServerReader } from "../infrastructure/runtime/cua-plugin-server-reader.js";
 import type { DurableNativeResourceLeaseCoordinatorLike } from "../infrastructure/runtime/durable-native-resource-lease-coordinator.js";
@@ -1431,6 +1435,7 @@ export interface OmniCodexRuntimeGateway {
 }
 
 export interface OmniCodexPreparedRuntime {
+  /** Original physical discovery identity, never the owned execution-cache path. */
   readonly candidate: RuntimeCandidate;
   readonly gateway: OmniCodexRuntimeGateway;
   readonly appServerMethodCount: number;
@@ -3366,6 +3371,13 @@ export class OmniCodexGatewayService {
     if (this.#options.prepareRuntime !== undefined) {
       return this.#options.prepareRuntime(candidate, options);
     }
+    // Keep discovery identity for the follower/switch, but use this one complete
+    // package for every owned child, including lazy per-work-session contexts.
+    const pinnedCandidate = await snapshotManagedCodexRuntime(
+      candidate,
+      join(omniCodexDataDirectory(), "engine-generations"),
+    );
+    throwIfRuntimePreparationAborted(options.signal);
     // One coordinator is shared by every transport in this prepared runtime,
     // but never across a hot runtime switch where native snapshots may differ.
     const readInvocationCoordinator = new ReadInvocationCoordinator();
@@ -3409,7 +3421,7 @@ export class OmniCodexGatewayService {
     let primary: RestartableCodexAppServerProcess | undefined;
     let operatorResponsesLease: SharedResponsesLease | undefined;
     let ownedBrowserNativeExecutor: BrowserNativeExecutor | undefined;
-    const detachedThreads = new CodexDetachedThreadClient(candidate, {
+    const detachedThreads = new CodexDetachedThreadClient(pinnedCandidate, {
       createProcess: (runtime, processOptions) =>
         new CodexAppServerConnection(runtime, processOptions),
       ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
@@ -3427,7 +3439,7 @@ export class OmniCodexGatewayService {
       // Keep Desktop native tools on its own server and share one isolated
       // provider-scoped server across operator and per-conversation turns.
       const sharedResponsesHost = new SharedResponsesAppServer(
-        candidate,
+        pinnedCandidate,
         {
           ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
           ...(this.#options.ownershipRegistry === undefined
@@ -3443,7 +3455,7 @@ export class OmniCodexGatewayService {
         },
         (runtime, processOptions) => new CodexAppServerProcess(runtime, processOptions),
       );
-      primary = new RestartableCodexAppServerProcess(candidate, {
+      primary = new RestartableCodexAppServerProcess(pinnedCandidate, {
         processFactory: (runtime, processOptions) =>
           new CodexAppServerConnection(runtime, processOptions),
         ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
@@ -3499,7 +3511,9 @@ export class OmniCodexGatewayService {
         // waiting for this exact dynamic-tool response and is not reentrant.
         fallbackThreadId: () => bridgeThreadContext.currentThreadId,
       });
-      const methodCatalog = new AppServerMethodCatalog(new CodexSchemaBundleLoader(candidate));
+      const methodCatalog = new AppServerMethodCatalog(
+        new CodexSchemaBundleLoader(pinnedCandidate),
+      );
       const appServerMethodExecutor = new AppServerMethodExecutor(primary.client);
       const workExecutorIds = new CodexWorkExecutorIdReader();
       const cuaServer = new CuaPluginServerReader(primary.client);
@@ -3704,7 +3718,7 @@ export class OmniCodexGatewayService {
         const operation = (async () => {
           // A separate pipe connection keeps inventory requests independent
           // of long native calls without creating another App Server process.
-          const reader = new CodexAppServerConnection(candidate, {
+          const reader = new CodexAppServerConnection(pinnedCandidate, {
             ...(this.#options.cwd === undefined ? {} : { cwd: this.#options.cwd }),
             onServerRequest: answerAppServerApprovalRequest,
             onNotification: (message) => this.#options.onDiagnostic?.(message),
@@ -3736,9 +3750,9 @@ export class OmniCodexGatewayService {
       const reconcileBridge = async () =>
         bridgeThreadContext.accept(
           await new OmniCodexBridgeReconciler({
-            candidate,
+            candidate: pinnedCandidate,
             dynamicTools: OMNICODEX_BRIDGE_CONTEXT_TOOLS,
-            bootstrapFactory: () => new CodexAppServerConnection(candidate),
+            bootstrapFactory: () => new CodexAppServerConnection(pinnedCandidate),
             ownerInspector: desktopIpc,
             threadLifecycle: createBridgeThreadLifecycle(ownedHostTools),
             env: runtimeEnvironment ?? {},
@@ -3816,7 +3830,7 @@ export class OmniCodexGatewayService {
         createNativeRuntime: (context, creationSignal) =>
           createDisposableNativeAppServerContext(
             {
-              candidate,
+              candidate: pinnedCandidate,
               processFactory: (runtime, processOptions) =>
                 new CodexAppServerConnection(runtime, processOptions),
               processOptions: {
@@ -5167,11 +5181,14 @@ type RuntimeStartupFailureClassification =
   | { readonly kind: "transient_candidate_readiness" }
   | {
       readonly kind: "candidate_local_incompatibility";
-      readonly reason: "process_launch" | "process_exit" | "protocol" | "schema";
+      readonly reason: "package" | "process_launch" | "process_exit" | "protocol" | "schema";
     }
   | { readonly kind: "fatal_or_common" };
 
 function classifyRuntimeStartupFailure(value: unknown): RuntimeStartupFailureClassification {
+  if (value instanceof CodexRuntimePackageError) {
+    return { kind: "candidate_local_incompatibility", reason: "package" };
+  }
   if (containsSharedAppToolsReadinessError(value)) {
     return { kind: "shared_desktop_readiness" };
   }
