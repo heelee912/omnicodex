@@ -61,6 +61,14 @@ afterEach(async () => {
 });
 
 describe("configured omnicodex2 scheduled startup", () => {
+  it("initializes supervisor state before direct CLI command parsing", async () => {
+    const source = await readFile(new URL("../src/cli.ts", import.meta.url), "utf8");
+    const parse = source.indexOf("await program.parseAsync(process.argv)");
+    expect(parse).toBeGreaterThan(source.indexOf("const OMNICODEX2_TUNNEL_CHECK_INTERVAL_MS"));
+    expect(parse).toBeGreaterThan(source.indexOf("let omniCodex2TunnelFlight"));
+    expect(parse).toBeGreaterThan(source.indexOf("let lastOmniCodex2TunnelFailure"));
+  });
+
   it("skips a machine without an existing omnicodex2 profile", async () => {
     await ensureConfiguredOmniCodex2Tunnel();
     expect(spawnMock).not.toHaveBeenCalled();

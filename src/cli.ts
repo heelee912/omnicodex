@@ -2183,8 +2183,6 @@ tunnel
     );
   });
 
-if (isDirectCliInvocation()) await program.parseAsync(process.argv);
-
 interface JsonOptions {
   readonly json?: boolean;
 }
@@ -4340,3 +4338,6 @@ function isDaemonLifecycle(value: unknown): value is OmniCodexDaemonState["lifec
 async function resolveNgrokExecutable(explicit: string | undefined): Promise<string> {
   return new NgrokInstaller({ dataDirectory: omniCodexDataDirectory() }).ensure(explicit);
 }
+
+// Finish module initialization before scheduled-task supervision starts.
+if (isDirectCliInvocation()) await program.parseAsync(process.argv);
