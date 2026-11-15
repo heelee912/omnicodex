@@ -2844,6 +2844,12 @@ async function startControlServer(
 ): Promise<Server> {
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
+    // end() can queue a write whose EPIPE arrives after the command settles.
+    // Keep containment on this owned socket, including after close; destroying
+    // it drives the existing disconnect cancellation and socket-set cleanup.
+    socket.on("error", () => {
+      if (!socket.destroyed) socket.destroy();
+    });
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     handleControlSocket(socket, token, identity, getLifecycle, onStop, onRuntimeControl);
@@ -3001,6 +3007,7 @@ function handleControlSocket(
                 );
           operationSettled = true;
           socket.removeListener("close", abortOnDisconnect);
+          if (socket.destroyed) return;
           const response = `${JSON.stringify({ ok: true, ...identity, lifecycle: getLifecycle(), ...(runtime === undefined ? {} : { runtime }) })}\n`;
           if (command === "stop") {
             // Flush the authenticated success proof before shutdown closes the
@@ -3014,6 +3021,7 @@ function handleControlSocket(
         } catch (error) {
           operationSettled = true;
           socket.removeListener("close", abortOnDisconnect);
+          if (socket.destroyed) return;
           socket.end(
             `${JSON.stringify({ ok: false, ...identity, lifecycle: getLifecycle(), error: toError(error).message })}\n`,
           );

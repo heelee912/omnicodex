@@ -253,6 +253,19 @@ export class ResponsesLoopbackDriver {
     this.#requestCount = 0;
     this.#stopping = false;
     const server = createServer((request, response) => {
+      // A successful write()/end() only queues bytes. Keep an error listener
+      // for this response's lifetime, even after handler/relay cleanup or close.
+      // Delivery failure must not cancel or replay an unrelated selected call.
+      response.on("error", () => {
+        if (!response.destroyed) response.destroy();
+      });
+      response.once("close", () => {
+        const retained = this.#retainedResponse;
+        if (retained?.response === response) {
+          this.#retainedResponse = undefined;
+          retained.release();
+        }
+      });
       const admittedBeforeDrain = !this.#stopping;
       this.#activeRequestCounts.set(server, (this.#activeRequestCounts.get(server) ?? 0) + 1);
       const operation = this.#handle(server, request, response, admittedBeforeDrain).catch(
@@ -674,6 +687,7 @@ export class ResponsesLoopbackDriver {
   }
 
   #retainResponse(response: ServerResponse, body: Record<string, unknown>): Promise<void> {
+    if (response.destroyed) return Promise.resolve();
     return new Promise<void>((release) => {
       this.#retainedResponse = { response, body, release };
     });
@@ -1225,9 +1239,12 @@ async function writeServerChunk(response: ServerResponse, chunk: string | Buffer
   if (response.destroyed) throw new Error("Loopback response closed during streaming");
   if (response.write(chunk)) return;
   await new Promise<void>((resolve, reject) => {
+    // This waiter is temporary; the response-lifetime listener remains installed.
+    // Reject on error as well as close, without waiting for a drain that cannot arrive.
     const cleanup = () => {
       response.removeListener("drain", onDrain);
       response.removeListener("close", onClose);
+      response.removeListener("error", onError);
     };
     const onDrain = () => {
       cleanup();
@@ -1237,8 +1254,14 @@ async function writeServerChunk(response: ServerResponse, chunk: string | Buffer
       cleanup();
       reject(new Error("Loopback response closed during backpressure wait"));
     };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
     response.once("drain", onDrain);
     response.once("close", onClose);
+    response.once("error", onError);
+    if (response.destroyed) onClose();
   });
 }
 
