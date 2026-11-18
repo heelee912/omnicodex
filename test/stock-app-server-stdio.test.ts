@@ -81,7 +81,7 @@ describe("stock Desktop app-server attachment", () => {
   });
 
   it.skipIf(process.platform !== "win32")(
-    "exits and cleans the owner registry when stock dies during publication and Desktop stdin stays open",
+    "exits and cleans the owner registry when stock exits and Desktop stdin stays open",
     async () => {
       const home = await mkdtemp(join(tmpdir(), "omnicodex-bridge-exit-"));
       const stockCode = `process.stdin.once('data', () => {
@@ -98,6 +98,7 @@ describe("stock Desktop app-server attachment", () => {
           async receiveServer(line) { this.ready = true; this.transport.sendDesktop(line); }
         }
         await bridgeDesktopAppServer(process.execPath, ['-e', ${JSON.stringify(stockCode)}], false, {
+          onDesktopReady: async () => undefined,
           readVersion: async () => {
             await new Promise((resolve) => setTimeout(resolve, 250));
             return '0.1.0';
@@ -176,6 +177,7 @@ describe("stock Desktop app-server attachment", () => {
       currentPid: node.pid,
       inspectProcesses: async () => [desktop, launcher, node],
       findExecutable: async () => executablePath,
+      prepareRuntime: async (executable: string) => ({ executable }),
       acquireStartupLock: async () => ({ release: async () => undefined }),
       startDesktopServer,
       attachDesktopServer,
@@ -197,6 +199,7 @@ describe("stock Desktop app-server attachment", () => {
       currentPid: node.pid,
       inspectProcesses: async () => [desktop, launcher, node],
       findExecutable: async () => executablePath,
+      prepareRuntime: async (executable: string) => ({ executable }),
       acquireStartupLock: async () => ({ release: async () => undefined }),
       startDesktopServer,
       attachDesktopServer,
@@ -317,26 +320,32 @@ describe("stock Desktop app-server attachment", () => {
     ).toEqual([]);
   });
 
-  it("waits for an orphaned stock server to exit before starting another", async () => {
-    const orphan = { ...server, parentPid: 999 };
-    let clock = 20_000;
-    const inspectProcesses = vi
-      .fn()
-      .mockResolvedValueOnce([desktop, launcher, node, orphan])
-      .mockResolvedValueOnce([desktop, launcher, node]);
-    const startup = await waitForDesktopStartupState({
-      initialProcesses: [desktop, launcher, node, orphan],
-      executablePath,
-      inspectProcesses,
-      now: () => clock,
-      pause: async (ms: number) => {
-        clock += ms;
-      },
-      timeoutMs: 5000,
-    });
-    expect(startup.action).toBe("start");
-    expect(inspectProcesses).toHaveBeenCalledTimes(2);
-  });
+  it.each([
+    executablePath,
+    executablePath.replace("\\build\\codex.exe", "\\desktop-runtime-test\\runtime\\codex.exe"),
+  ])(
+    "waits for orphaned stock servers across generations before starting %s",
+    async (selectedExecutable) => {
+      const orphan = { ...server, parentPid: 999 };
+      let clock = 20_000;
+      const inspectProcesses = vi
+        .fn()
+        .mockResolvedValueOnce([desktop, launcher, node, orphan])
+        .mockResolvedValueOnce([desktop, launcher, node]);
+      const startup = await waitForDesktopStartupState({
+        initialProcesses: [desktop, launcher, node, orphan],
+        executablePath: selectedExecutable,
+        inspectProcesses,
+        now: () => clock,
+        pause: async (ms: number) => {
+          clock += ms;
+        },
+        timeoutMs: 5000,
+      });
+      expect(startup.action).toBe("start");
+      expect(inspectProcesses).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("fails with a deadline if the orphaned server does not exit", async () => {
     const orphan = { ...server, parentPid: 999 };
@@ -494,6 +503,7 @@ describe.skipIf(process.platform !== "win32")("Windows Desktop startup lock", ()
       currentPid: node.pid,
       inspectProcesses: async () => (running ? processes : [desktop, launcher, node]),
       findExecutable: async () => executablePath,
+      prepareRuntime: async (executable: string) => ({ executable }),
       acquireStartupLock: () => acquireDesktopStartupLock({ pipeName, timeoutMs: 4000 }),
       startDesktopServer,
       attachDesktopServer,
@@ -542,6 +552,7 @@ describe.skipIf(process.platform !== "win32")("Windows Desktop startup lock", ()
       currentPid: node.pid,
       inspectProcesses: async () => (running ? processes : [desktop, launcher, node]),
       findExecutable: async () => executablePath,
+      prepareRuntime: async (executable: string) => ({ executable }),
       acquireStartupLock: () => acquireDesktopStartupLock({ pipeName, timeoutMs: 4000 }),
       startDesktopServer,
       attachDesktopServer: vi.fn(async () => undefined),

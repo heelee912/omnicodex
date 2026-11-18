@@ -9,7 +9,12 @@ import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { findStockExecutable, readStockVersion } from "./stock-codex-executable.mjs";
+import {
+  findStockExecutable,
+  prepareDesktopRuntime,
+  readStockVersion,
+  stockManagedRoot,
+} from "./stock-codex-executable.mjs";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_DESKTOP_WAIT_MS = 15_000;
@@ -41,6 +46,7 @@ export async function main(
   args,
   {
     findExecutable = findStockExecutable,
+    prepareRuntime = prepareDesktopRuntime,
     inspectProcesses = inspectDesktopProcesses,
     startDesktopServer = bridgeDesktopAppServer,
     attachDesktopServer = attachToDesktopAppServer,
@@ -97,7 +103,11 @@ export async function main(
       await attachDesktopServer(startup.processes);
       return;
     }
-    await startDesktopServer(executable, args, false, {
+    const owner = desktopLauncherOwner(startup.processes, currentPid);
+    if (!owner) throw new Error("Desktop launcher ownership changed before runtime staging");
+    const runtime = await prepareRuntime(executable, owner);
+    await startDesktopServer(runtime.executable, args, false, {
+      onDesktopReady: runtime.activate,
       onStartupFinished: release,
     });
   } finally {
@@ -172,18 +182,22 @@ async function attachToDesktopAppServer(initialProcesses) {
 
 /** Only Desktop's own launcher may create the primary server. */
 export function isDesktopLauncher(processes, nodePid) {
+  return desktopLauncherOwner(processes, nodePid) !== undefined;
+}
+
+function desktopLauncherOwner(processes, nodePid) {
   const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
   const node = byPid.get(nodePid);
   const launcher = byPid.get(node?.parentPid);
   const desktop = byPid.get(launcher?.parentPid);
-  return (
-    lowerName(node) === "node.exe" &&
+  return lowerName(node) === "node.exe" &&
     isStockBridgeNode(node) &&
     lowerName(launcher) === "omnicodexdesktopengine.exe" &&
     !hasLostOrReusedParent(node, launcher) &&
     !hasLostOrReusedParent(launcher, desktop) &&
     isDesktopMainProcess(desktop)
-  );
+    ? desktop
+    : undefined;
 }
 
 /** Reject stale records, PID reuse, and servers not owned by the running Desktop. */
@@ -301,7 +315,7 @@ export async function waitForDesktopStartupState({
 
 function hasOrphanedStockAppServer(processes, executablePath) {
   const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
-  const managedBin = win32.dirname(win32.dirname(win32.normalize(executablePath))).toLowerCase();
+  const managedBin = stockManagedRoot(executablePath).toLowerCase();
   return processes.some((entry) => {
     if (lowerName(entry) !== "codex.exe" || !isAppServer(entry)) return false;
     if (typeof entry.executablePath !== "string") return false;
@@ -516,6 +530,7 @@ export async function bridgeDesktopAppServer(
   auxiliary,
   {
     onStartupFinished,
+    onDesktopReady,
     readVersion = readStockVersion,
     loadBridgeModules = () =>
       Promise.all([
@@ -636,6 +651,7 @@ export async function bridgeDesktopAppServer(
       await rename(temporary, recordPath);
       if (stopped) return;
       published = true;
+      await onDesktopReady?.();
       await onStartupFinished?.();
     })();
     publishFlight = flight;
