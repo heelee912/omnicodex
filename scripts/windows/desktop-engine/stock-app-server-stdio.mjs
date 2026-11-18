@@ -21,10 +21,6 @@ const DEFAULT_DESKTOP_WAIT_MS = 15_000;
 const PROCESS_INSPECTION_INTERVAL_MS = 2_000;
 const RECORD_POLL_INTERVAL_MS = 250;
 
-if (isDirectEntrypoint(process.argv[1])) {
-  await main(process.argv.slice(2));
-}
-
 export function isDirectEntrypoint(entryPath, modulePath = fileURLToPath(import.meta.url)) {
   if (typeof entryPath !== "string") return false;
   const entry = actualPath(entryPath);
@@ -530,6 +526,7 @@ export function closeDesktopInput(lines, input = process.stdin) {
 export const STOCK_STDOUT_LIMITS = Object.freeze({
   maxChars: 32 * 1024 * 1024,
   maxBytes: 48 * 1024 * 1024,
+  maxNormalBytes: 256 * 1024 * 1024,
   maxFragments: 32,
   timeoutMs: 10_000,
 });
@@ -635,16 +632,25 @@ export async function receiveStockStdout(
       throw stdoutFailure("invalid-utf8");
     }
     const separator = pending === undefined ? 0 : 2; // JSON escape, not raw LF.
-    if (retainedChars + separator + line.length > limits.maxChars)
-      throw stdoutFailure("character-budget");
     const crlf = line.endsWith("\r");
     if ((crlf ? line.slice(0, -1) : line).includes("\r")) throw stdoutFailure("control-character");
     const message = parseStockJson(line);
     if (pending === undefined && message !== undefined) {
-      await router.receiveServer(line);
-      await onMessage();
+      try {
+        await router.receiveServer(line);
+      } catch {
+        throw stdoutFailure("router");
+      }
+      try {
+        await onMessage();
+      } catch {
+        throw stdoutFailure("publish");
+      }
       return;
     }
+    if (retainedChars + separator + line.length > limits.maxChars)
+      throw stdoutFailure("character-budget");
+    if (pending === undefined && bytes.length > limits.maxBytes) throw stdoutFailure("byte-budget");
     if (pending === undefined) {
       const id = resumePrefixId(line);
       pending = router.selectPendingDesktopResume(id);
@@ -692,8 +698,16 @@ export async function receiveStockStdout(
       throw stdoutFailure("invalid-resume-response");
     if (performance.now() >= deadline) throw stdoutFailure("timeout");
     clear();
-    await router.receiveServer(restored);
-    await onMessage();
+    try {
+      await router.receiveServer(restored);
+    } catch {
+      throw stdoutFailure("router");
+    }
+    try {
+      await onMessage();
+    } catch {
+      throw stdoutFailure("publish");
+    }
   };
   if (signal?.aborted) {
     cancel();
@@ -710,12 +724,13 @@ export async function receiveStockStdout(
         const lf = buffer.indexOf(0x0a, offset);
         const end = lf === -1 ? buffer.length : lf;
         const length = end - offset;
-        if (retainedBytes + pieceBytes + length + (pending === undefined ? 0 : 2) > limits.maxBytes)
+        const budget = pending === undefined ? limits.maxNormalBytes : limits.maxBytes;
+        if (retainedBytes + pieceBytes + length + (pending === undefined ? 0 : 2) > budget)
           throw stdoutFailure("byte-budget");
         // Geometric storage also bounds allocation metadata for tiny chunk splits.
         if (pieceBytes + length > lineBytes.length) {
           const capacity = Math.min(
-            limits.maxBytes,
+            budget,
             Math.max(64 * 1024, pieceBytes + length, lineBytes.length * 2),
           );
           const grown = Buffer.allocUnsafe(capacity);
@@ -729,6 +744,8 @@ export async function receiveStockStdout(
         pieceBytes = 0;
         await acceptLine(bytes);
         offset = lf + 1;
+        if (pending === undefined && lineBytes.length > limits.maxBytes)
+          lineBytes = Buffer.alloc(0);
       }
     }
     if (timedOut) throw stdoutFailure("timeout");
@@ -893,9 +910,26 @@ export async function bridgeDesktopAppServer(
     void receiveStockStdout(stock.stdout, router, {
       signal: stdoutAbort.signal,
       onMessage: publish,
-    }).catch(() => {
+    }).catch((error) => {
+      const reason = /^Stock stdout rejected \(([a-z-]+)\)$/u.exec(error?.message ?? "")?.[1];
+      const code = /^[A-Z][A-Z0-9_]{0,47}$/u.test(error?.code ?? "")
+        ? error.code.toLowerCase().replaceAll("_", "-")
+        : undefined;
+      const sites = [...(error?.stack ?? "").matchAll(/stock-app-server-stdio\.mjs:(\d+):\d+/gu)]
+        .slice(0, 3)
+        .map((match) => match[1])
+        .join("-");
+      const safeName = /^[A-Za-z][A-Za-z0-9]{0,39}$/u.test(error?.name ?? "")
+        ? error.name.toLowerCase()
+        : typeof error;
+      const constructorName = error?.constructor?.name;
+      const safeConstructor = /^[A-Za-z][A-Za-z0-9]{0,39}$/u.test(constructorName ?? "")
+        ? constructorName.toLowerCase()
+        : "unknown";
+      const safeTag =
+        reason ?? code ?? `${safeName}-${safeConstructor}${sites === "" ? "" : `-lines-${sites}`}`;
       console.error(
-        "Codex Desktop App Server output failed (invalid or incomplete stock response)",
+        `Codex Desktop App Server output failed (invalid or incomplete stock response) [${safeTag}]`,
       );
       process.exitCode = 1;
       void stop();
@@ -904,4 +938,9 @@ export async function bridgeDesktopAppServer(
   } finally {
     await stop();
   }
+}
+
+// Run the direct launcher only after every module-level runtime binding is initialized.
+if (isDirectEntrypoint(process.argv[1])) {
+  await main(process.argv.slice(2));
 }

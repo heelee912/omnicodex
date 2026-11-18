@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -66,6 +67,18 @@ function stdout(text: string, chunkSize = 11) {
 }
 
 describe("fail-closed primary stock stdout resume recovery", () => {
+  it("initializes all module bindings before direct Desktop startup", async () => {
+    const source = await readFile(
+      resolve("scripts/windows/desktop-engine/stock-app-server-stdio.mjs"),
+      "utf8",
+    );
+    const direct = source.lastIndexOf("if (isDirectEntrypoint(process.argv[1])) {");
+    expect(direct).toBeGreaterThan(source.indexOf("export const STOCK_STDOUT_LIMITS"));
+    expect(source.slice(direct).trimEnd()).toBe(
+      "if (isDirectEntrypoint(process.argv[1])) {\n  await main(process.argv.slice(2));\n}",
+    );
+  });
+
   it("recovers a 20.4M-character, nine-fragment fake native response only once for Desktop", async () => {
     const h = await harness();
     const first = h.addClient("other-thread-a");
@@ -151,6 +164,31 @@ describe("fail-closed primary stock stdout resume recovery", () => {
     expect(client.messages.map((line) => JSON.parse(line))).toEqual([
       { id: 17, result: { thread: { id: "other-thread" } } },
     ]);
+  });
+
+  it("passes a valid large JSONL frame without applying the resume recovery budget", async () => {
+    const h = await harness();
+    const valid = JSON.stringify({ id: 42, result: { payload: "x".repeat(33 * 1024 * 1024) } });
+    await receiveStockStdout(stdout(`${valid}\n`, 512 * 1024), h.router);
+    expect(h.desktop).toHaveLength(1);
+    expect(h.desktop[0]?.length).toBe(valid.length);
+    expect(h.router.selectPendingDesktopResume(17)).toBeDefined();
+  });
+
+  it("uses a separate finite byte cap for valid normal frames", async () => {
+    const h = await harness();
+    const valid = '{"id":42,"result":{"text":"normal"}}\n';
+    await receiveStockStdout(stdout(valid), h.router, {
+      maxBytes: 4,
+      maxNormalBytes: Buffer.byteLength(valid),
+    });
+    expect(h.desktop).toHaveLength(1);
+    await expect(
+      receiveStockStdout(stdout(valid), h.router, {
+        maxNormalBytes: Buffer.byteLength(valid) - 2,
+      }),
+    ).rejects.toThrow("byte-budget");
+    expect(h.desktop).toHaveLength(1);
   });
 
   it("provides only immutable, exact, unconsumed Desktop resume proofs", async () => {
@@ -249,6 +287,7 @@ describe("fail-closed primary stock stdout resume recovery", () => {
     expect(STOCK_STDOUT_LIMITS).toEqual({
       maxChars: 33554432,
       maxBytes: 50331648,
+      maxNormalBytes: 268435456,
       maxFragments: 32,
       timeoutMs: 10000,
     });
@@ -410,7 +449,7 @@ describe("fail-closed primary stock stdout resume recovery", () => {
         wrapper.stdin.write('{"id":0,"method":"initialize"}\n');
         expect((await closed)[0]).toBe(1);
         expect(diagnostic).toBe(
-          "Codex Desktop App Server output failed (invalid or incomplete stock response)\n",
+          "Codex Desktop App Server output failed (invalid or incomplete stock response) [not-desktop-resume]\n",
         );
         expect(diagnostic).not.toContain("synthetic-private-marker");
       } finally {
