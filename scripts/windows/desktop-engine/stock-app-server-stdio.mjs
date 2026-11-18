@@ -524,6 +524,224 @@ export function closeDesktopInput(lines, input = process.stdin) {
   input.pause();
 }
 
+// Native 0.169 can put literal LF in a Desktop resume string. This is deliberately
+// not a general JSON repair path: require an id-first success envelope and a live,
+// exact Desktop-owned resume before retaining anything across a line boundary.
+export const STOCK_STDOUT_LIMITS = Object.freeze({
+  maxChars: 32 * 1024 * 1024,
+  maxBytes: 48 * 1024 * 1024,
+  maxFragments: 32,
+  timeoutMs: 10_000,
+});
+
+function stdoutFailure(reason) {
+  // Never include native text, identifiers, JSON.parse errors, or error causes.
+  return new Error(`Stock stdout rejected (${reason})`);
+}
+
+function parseStockJson(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+}
+
+function resumePrefixId(line) {
+  // Bound header work independently of the (potentially very large) string body.
+  const header =
+    /^\s*\{\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?"id"\s*:\s*("(?:[^"\\]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*,\s*"result"\s*:\s*\{/u.exec(
+      line.slice(0, 4096),
+    );
+  return header === null ? undefined : parseStockJson(header[1]);
+}
+
+class StockJsonScanner {
+  inString = false;
+  escaped = false;
+  unicode = 0;
+  stack = [];
+
+  scan(text) {
+    for (let index = 0; index < text.length; index++) {
+      const char = text[index];
+      const code = text.charCodeAt(index);
+      if (this.inString) {
+        if (code < 0x20) throw stdoutFailure("control-character");
+        if (this.unicode > 0) {
+          if (!/[0-9a-f]/iu.test(char)) throw stdoutFailure("invalid-escape");
+          this.unicode--;
+        } else if (this.escaped) {
+          this.escaped = false;
+          if (char === "u") this.unicode = 4;
+          else if (!'"\\/bfnrt'.includes(char)) throw stdoutFailure("invalid-escape");
+        } else if (char === "\\") this.escaped = true;
+        else if (char === '"') this.inString = false;
+      } else {
+        if (code < 0x20 && char !== "\t") throw stdoutFailure("control-character");
+        if (char === '"') this.inString = true;
+        else if (char === "{" || char === "[") {
+          if (this.stack.length >= 256) throw stdoutFailure("nesting-budget");
+          this.stack.push(char);
+        } else if (char === "}" || char === "]") {
+          if (this.stack.pop() !== (char === "}" ? "{" : "["))
+            throw stdoutFailure("invalid-structure");
+        }
+      }
+    }
+  }
+
+  get canEscapeLf() {
+    return this.inString && !this.escaped && this.unicode === 0;
+  }
+}
+
+/** Consume only primary native stdout, retaining at most one verified resume. */
+export async function receiveStockStdout(
+  input,
+  router,
+  { signal, onMessage = () => undefined, ...overrides } = {},
+) {
+  const limits = { ...STOCK_STDOUT_LIMITS, ...overrides };
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  let lineBytes = Buffer.alloc(0);
+  let pieceBytes = 0;
+  let fragments = [];
+  let fragmentCount = 0;
+  let retainedBytes = 0;
+  let retainedChars = 0;
+  let pending;
+  let scanner;
+  let timer;
+  let deadline;
+  let timedOut = false;
+  const clear = () => {
+    clearTimeout(timer);
+    lineBytes = Buffer.alloc(0);
+    fragments = [];
+    pending = undefined;
+    scanner = undefined;
+    pieceBytes = retainedBytes = retainedChars = fragmentCount = 0;
+  };
+  const cancel = () => {
+    clear();
+    input.destroy();
+  };
+  const acceptLine = async (bytes) => {
+    let line;
+    try {
+      line = decoder.decode(bytes);
+    } catch {
+      throw stdoutFailure("invalid-utf8");
+    }
+    const separator = pending === undefined ? 0 : 2; // JSON escape, not raw LF.
+    if (retainedChars + separator + line.length > limits.maxChars)
+      throw stdoutFailure("character-budget");
+    const crlf = line.endsWith("\r");
+    if ((crlf ? line.slice(0, -1) : line).includes("\r")) throw stdoutFailure("control-character");
+    const message = parseStockJson(line);
+    if (pending === undefined && message !== undefined) {
+      await router.receiveServer(line);
+      await onMessage();
+      return;
+    }
+    if (pending === undefined) {
+      const id = resumePrefixId(line);
+      pending = router.selectPendingDesktopResume(id);
+      if (pending === undefined) throw stdoutFailure("not-desktop-resume");
+      scanner = new StockJsonScanner();
+      deadline = performance.now() + limits.timeoutMs;
+      timer = setTimeout(() => {
+        timedOut = true;
+        clear();
+        input.destroy(stdoutFailure("timeout"));
+      }, limits.timeoutMs);
+    } else {
+      if (performance.now() >= deadline) throw stdoutFailure("timeout");
+      // A separate response/notification must never be swallowed as resume text.
+      if (
+        message !== null &&
+        typeof message === "object" &&
+        ["id", "method", "jsonrpc"].some((key) => Object.hasOwn(message, key))
+      )
+        throw stdoutFailure("intervening-envelope");
+    }
+    if (++fragmentCount > limits.maxFragments) throw stdoutFailure("fragment-budget");
+    if (crlf) line = line.slice(0, -1);
+    scanner.scan(line);
+    if (performance.now() >= deadline) throw stdoutFailure("timeout");
+    if (crlf && scanner.inString) throw stdoutFailure("control-character");
+    if (separator > 0) fragments.push("\\n");
+    fragments.push(line);
+    retainedBytes += bytes.length + separator;
+    retainedChars += line.length + separator;
+    if (scanner.canEscapeLf) return;
+    if (scanner.inString || scanner.stack.length !== 0) throw stdoutFailure("incomplete-json");
+    const restored = fragments.join("");
+    const response = parseStockJson(restored);
+    if (
+      response === null ||
+      typeof response !== "object" ||
+      Array.isArray(response) ||
+      response.id !== pending.id ||
+      response.result?.thread?.id !== pending.threadId ||
+      Object.keys(response).some((key) => !["id", "result", "jsonrpc"].includes(key)) ||
+      (Object.hasOwn(response, "jsonrpc") && response.jsonrpc !== "2.0") ||
+      router.selectPendingDesktopResume(pending.id) !== pending
+    )
+      throw stdoutFailure("invalid-resume-response");
+    if (performance.now() >= deadline) throw stdoutFailure("timeout");
+    clear();
+    await router.receiveServer(restored);
+    await onMessage();
+  };
+  if (signal?.aborted) {
+    cancel();
+    return;
+  }
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    for await (const chunk of input) {
+      if (signal?.aborted) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let offset = 0;
+      while (offset < buffer.length) {
+        if (signal?.aborted) return;
+        const lf = buffer.indexOf(0x0a, offset);
+        const end = lf === -1 ? buffer.length : lf;
+        const length = end - offset;
+        if (retainedBytes + pieceBytes + length + (pending === undefined ? 0 : 2) > limits.maxBytes)
+          throw stdoutFailure("byte-budget");
+        // Geometric storage also bounds allocation metadata for tiny chunk splits.
+        if (pieceBytes + length > lineBytes.length) {
+          const capacity = Math.min(
+            limits.maxBytes,
+            Math.max(64 * 1024, pieceBytes + length, lineBytes.length * 2),
+          );
+          const grown = Buffer.allocUnsafe(capacity);
+          lineBytes.copy(grown, 0, 0, pieceBytes);
+          lineBytes = grown;
+        }
+        buffer.copy(lineBytes, pieceBytes, offset, end);
+        pieceBytes += length;
+        if (lf === -1) break;
+        const bytes = lineBytes.subarray(0, pieceBytes);
+        pieceBytes = 0;
+        await acceptLine(bytes);
+        offset = lf + 1;
+      }
+    }
+    if (timedOut) throw stdoutFailure("timeout");
+    if (!signal?.aborted && (pending !== undefined || pieceBytes > 0))
+      throw stdoutFailure("truncated-eof");
+  } catch (error) {
+    if (!signal?.aborted) throw error;
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    clear();
+  }
+}
+
 export async function bridgeDesktopAppServer(
   executable,
   desktopArgs,
@@ -562,6 +780,7 @@ export async function bridgeDesktopAppServer(
   let desktopLines;
   let publishFlight;
   let stopFlight;
+  const stdoutAbort = new AbortController();
   const router = new StdioAppServerRouter({
     sendServer: (line) => stock.stdin.write(`${line}\n`),
     sendDesktop: (line) => process.stdout.write(`${line}\n`),
@@ -581,6 +800,7 @@ export async function bridgeDesktopAppServer(
   const stop = () => {
     if (stopFlight) return stopFlight;
     stopped = true;
+    stdoutAbort.abort();
     // A dead stock child must not leave Desktop waiting on a live stdio bridge.
     closeDesktopInput(desktopLines);
     for (const peer of peers) peer.destroy();
@@ -670,14 +890,13 @@ export async function bridgeDesktopAppServer(
       });
     });
     desktopLines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-    const stockLines = createInterface({ input: stock.stdout, crlfDelay: Infinity });
-    void (async () => {
-      for await (const line of stockLines) {
-        await router.receiveServer(line);
-        await publish();
-      }
-    })().catch((error) => {
-      console.error(`Codex Desktop App Server output failed: ${error}`);
+    void receiveStockStdout(stock.stdout, router, {
+      signal: stdoutAbort.signal,
+      onMessage: publish,
+    }).catch(() => {
+      console.error(
+        "Codex Desktop App Server output failed (invalid or incomplete stock response)",
+      );
       process.exitCode = 1;
       void stop();
     });

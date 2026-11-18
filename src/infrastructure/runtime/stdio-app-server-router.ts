@@ -34,6 +34,7 @@ interface PendingServerRequest {
 }
 
 interface PendingDesktopThreadTransition {
+  readonly id: string | number;
   readonly method: "thread/resume" | "turn/start";
   readonly threadId: string;
 }
@@ -97,18 +98,29 @@ export class StdioAppServerRouter {
     }
   }
 
+  /** Read-only proof for the stock stdout boundary; never claims or consumes a request. */
+  selectPendingDesktopResume(id: unknown): PendingDesktopThreadTransition | undefined {
+    if (!isId(id) || this.#pendingCalls.has(String(id))) return undefined;
+    const pending = this.#pendingDesktopThreadTransitions.get(String(id));
+    return pending?.method === "thread/resume" && pending.id === id ? pending : undefined;
+  }
+
   receiveDesktop(line: string): void {
     const message = parseMessage(line);
+    if (typeof message.method === "string" && isId(message.id)) {
+      // A reused id must not leave stale resume-recovery authority behind.
+      this.#pendingDesktopThreadTransitions.delete(String(message.id));
+    }
     if (
       (message.method === "thread/resume" || message.method === "turn/start") &&
       isId(message.id)
     ) {
       const threadId = stringValue(objectValue(message.params)?.threadId);
       if (threadId !== undefined) {
-        this.#pendingDesktopThreadTransitions.set(String(message.id), {
-          method: message.method,
-          threadId,
-        });
+        this.#pendingDesktopThreadTransitions.set(
+          String(message.id),
+          Object.freeze({ id: message.id, method: message.method, threadId }),
+        );
       }
     }
     if (message.method === "initialize" && isId(message.id)) {
