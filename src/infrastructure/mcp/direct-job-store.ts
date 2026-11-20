@@ -1,11 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { omniCodexDataDirectory } from "../config/omnicodex-config-store.js";
 import { canonicalJson } from "../safety/canonical-json.js";
+import { readLegacyDirectJobs } from "./direct-job-legacy-reader.js";
+import {
+  assertDirectJobMigrationSource,
+  commitDirectJobMigration,
+  type DirectJobMigrationState,
+  prepareDirectJobMigration,
+} from "./direct-job-migration-state.js";
 
-const SCHEMA_VERSION = 1;
 const RESTART_BEFORE_DISPATCH = "PROCESS_RESTART_BEFORE_DISPATCH";
 const RESTART_AFTER_DISPATCH = "PROCESS_RESTART_AFTER_DISPATCH";
 
@@ -151,14 +158,19 @@ interface StoredJob {
   readonly error?: DirectJobErrorView;
 }
 
-interface SnapshotPayload {
-  readonly schemaVersion: typeof SCHEMA_VERSION;
+interface LedgerMetadata {
+  readonly schemaVersion: 1;
   readonly revision: number;
-  readonly jobs: readonly StoredJob[];
+  readonly jobCount: number;
+  readonly legacyChecksum: string | null;
 }
 
-interface StoredSnapshot extends SnapshotPayload {
-  readonly checksum: string;
+interface MigrationBootstrap {
+  readonly schemaVersion: 1;
+  readonly pendingChecksum: string;
+  readonly initialRevision: number;
+  readonly initialJobCount: number;
+  readonly legacyChecksum: string | null;
 }
 
 interface DirectJobConfiguration {
@@ -175,7 +187,7 @@ interface CoreRegistryEntry {
   readonly promise: Promise<DirectJobCore>;
 }
 
-const PROCESS_CORES_SYMBOL = Symbol.for("@heelee912/omnicodex/direct-job-cores/v1");
+const PROCESS_CORES_SYMBOL = Symbol.for("@heelee912/omnicodex/direct-job-cores/sqlite-v1");
 const processCores = processCoreRegistry();
 
 /**
@@ -184,10 +196,24 @@ const processCores = processCoreRegistry();
  * capability; execution is supplied by the server-owned direct dispatcher.
  */
 export class DirectJobStore {
-  readonly #core: DirectJobCore;
+  readonly #sharedCore: DirectJobCore;
+  #closed = false;
 
   private constructor(core: DirectJobCore) {
-    this.#core = core;
+    this.#sharedCore = core;
+    core.retain();
+  }
+
+  get #core(): DirectJobCore {
+    if (this.#closed) throw new DirectJobStateError("Direct job store is closed");
+    return this.#sharedCore;
+  }
+
+  /** Releases this handle. Other handles opened for the same path remain usable. */
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    await this.#sharedCore.release();
   }
 
   static async open(options: DirectJobStoreOptions = {}): Promise<DirectJobStore> {
@@ -196,7 +222,9 @@ export class DirectJobStore {
     const existing = processCores.get(key);
     if (existing !== undefined) {
       assertSameConfiguration(existing.configuration, configuration);
-      return new DirectJobStore(await existing.promise);
+      const core = await existing.promise;
+      if (core.disposed) return DirectJobStore.open(options);
+      return new DirectJobStore(core);
     }
     const promise = DirectJobCore.open(configuration);
     const entry = { configuration, promise };
@@ -215,6 +243,12 @@ export class DirectJobStore {
 
   get snapshotPath(): string | undefined {
     return this.#core.snapshotPath;
+  }
+
+  /** SQLite sidecar; snapshotPath remains the immutable legacy migration source. */
+  get databasePath(): string | undefined {
+    const path = this.#core.snapshotPath;
+    return path === undefined ? undefined : `${path}.sqlite`;
   }
 
   start(input: DirectJobStartInput): Promise<DirectJobStartView> {
@@ -307,28 +341,59 @@ class DirectJobCore {
   #jobs: Map<string, StoredJob>;
   #revision: number;
   #tail: Promise<void> = Promise.resolve();
+  readonly #database: SqliteJobLedger | undefined;
+  #references = 0;
+  #disposed = false;
 
   private constructor(
     configuration: DirectJobConfiguration,
     revision: number,
     jobs: Map<string, StoredJob>,
+    database?: SqliteJobLedger,
   ) {
     this.#configuration = configuration;
     this.#revision = revision;
     this.#jobs = jobs;
+    this.#database = database;
   }
 
   static async open(
     configuration: DirectJobConfiguration & { readonly snapshotPath: string },
   ): Promise<DirectJobCore> {
-    const loaded = await loadSnapshot(configuration.snapshotPath, configuration.maxResultBytes);
-    const core = new DirectJobCore(configuration, loaded.revision, loaded.jobs);
-    await core.#recoverAfterRestart();
-    return core;
+    const database = await SqliteJobLedger.open(configuration);
+    const core = new DirectJobCore(configuration, 0, new Map(), database);
+    try {
+      await core.#recoverAfterRestart();
+      return core;
+    } catch (error) {
+      database.close();
+      throw error;
+    }
   }
 
   static inMemory(configuration: DirectJobConfiguration): DirectJobCore {
     return new DirectJobCore(configuration, 0, new Map());
+  }
+
+  get disposed(): boolean {
+    return this.#disposed;
+  }
+
+  retain(): void {
+    if (this.#disposed) throw new DirectJobStateError("Direct job store is closed");
+    this.#references += 1;
+  }
+
+  async release(): Promise<void> {
+    this.#references -= 1;
+    if (this.#references !== 0) return;
+    await this.#tail;
+    // An already-pending open may have retained this core while close drained.
+    if (this.#references !== 0) return;
+    this.#disposed = true;
+    const path = this.#configuration.snapshotPath;
+    if (path !== undefined) processCores.delete(processPathKey(path));
+    this.#database?.close();
   }
 
   get snapshotPath(): string | undefined {
@@ -347,7 +412,7 @@ class DirectJobCore {
       const recordDigest = directJobRecordDigest(scope, idempotencyDigest);
       const jobId = publicId(recordDigest, 4);
       const operationId = publicId(digestText(`operation\0${recordDigest}`), 5);
-      const current = this.#jobs.get(jobId);
+      const current = this.#getJob(jobId);
       if (current !== undefined) {
         assertScope(current, scope);
         if (current.fingerprintDigest !== fingerprintDigest) throw new DirectJobConflictError();
@@ -367,9 +432,7 @@ class DirectJobCore {
         createdAtUnixMs: timestamp,
         updatedAtUnixMs: timestamp,
       };
-      const next = this.#prunedForInsert();
-      next.set(jobId, created);
-      await this.#commit(next);
+      this.#commit(created, true);
       return { disposition: "created", job: publicView(created) };
     });
   }
@@ -384,7 +447,7 @@ class DirectJobCore {
         arguments: input.arguments,
       });
       const jobId = publicId(directJobRecordDigest(scope, idempotencyDigest), 4);
-      const current = this.#jobs.get(jobId);
+      const current = this.#getJob(jobId);
       if (current === undefined) return undefined;
       assertScope(current, scope);
       if (current.fingerprintDigest !== fingerprintDigest) throw new DirectJobConflictError();
@@ -394,7 +457,7 @@ class DirectJobCore {
 
   get(input: DirectJobAccessInput): Promise<DirectJobView | undefined> {
     return this.#serialized(async () => {
-      const current = this.#jobs.get(input.jobId);
+      const current = this.#getJob(input.jobId);
       if (current === undefined || !scopeMatches(current, scopeDigests(input))) return undefined;
       return publicView(current);
     });
@@ -403,6 +466,7 @@ class DirectJobCore {
   list(input: DirectJobListInput): Promise<DirectJobListView> {
     return this.#serialized(async () => {
       const scope = scopeDigests(input);
+      if (this.#database !== undefined) return this.#database.list(input, scope);
       const statusSet = input.statuses === undefined ? undefined : new Set(input.statuses);
       const scoped = [...this.#jobs.values()]
         .filter((job) => scopeMatches(job, scope) && (statusSet?.has(job.status) ?? true))
@@ -501,9 +565,7 @@ class DirectJobCore {
         timestamp,
         { error },
       );
-      const next = new Map(this.#jobs);
-      next.set(current.jobId, nextJob);
-      await this.#commit(next);
+      this.#commit(nextJob);
       return publicView(nextJob);
     });
   }
@@ -529,9 +591,7 @@ class DirectJobCore {
               cancelRequestedAtUnixMs: current.cancelRequestedAtUnixMs ?? timestamp,
               updatedAtUnixMs: timestamp,
             };
-      const next = new Map(this.#jobs);
-      next.set(current.jobId, nextJob);
-      await this.#commit(next);
+      this.#commit(nextJob);
       return {
         disposition: current.status === "queued" ? "cancelled" : "cancellation_requested",
         job: publicView(nextJob),
@@ -557,19 +617,21 @@ class DirectJobCore {
     return this.#serialized(async () => {
       const current = this.#requiredScopedJob(input.jobId, scopeDigests(input));
       const nextJob = update(current, this.#timestampAfter(current.updatedAtUnixMs));
-      const next = new Map(this.#jobs);
-      next.set(current.jobId, nextJob);
-      await this.#commit(next);
+      this.#commit(nextJob);
       return publicView(nextJob);
     });
   }
 
   #requiredScopedJob(jobId: string, scope: ScopeDigests): StoredJob {
-    const current = this.#jobs.get(jobId);
+    const current = this.#getJob(jobId);
     if (current === undefined || !scopeMatches(current, scope)) {
       throw new DirectJobStateError("Direct job was not found in this owner work session");
     }
     return current;
+  }
+
+  #getJob(jobId: string): StoredJob | undefined {
+    return this.#database?.get(jobId) ?? this.#jobs.get(jobId);
   }
 
   #assertResultSize(result: CallToolResult): void {
@@ -601,54 +663,53 @@ class DirectJobCore {
   }
 
   async #recoverAfterRestart(): Promise<void> {
-    let changed = false;
-    const timestamp = checkedTimestamp(this.#configuration.nowUnixMs());
-    const next = new Map<string, StoredJob>();
-    for (const [jobId, job] of this.#jobs) {
-      if (job.status === "queued") {
-        changed = true;
-        next.set(
-          jobId,
-          terminalJob(job, "cancelled", Math.max(timestamp, job.updatedAtUnixMs), {
-            error: {
-              code: RESTART_BEFORE_DISPATCH,
-              message: "Daemon restarted before native dispatch began; the job is safe to resubmit",
-            },
-          }),
-        );
-      } else if (job.status === "running") {
-        changed = true;
-        next.set(
-          jobId,
-          terminalJob(job, "outcome_unknown", Math.max(timestamp, job.updatedAtUnixMs), {
-            error: {
-              code: RESTART_AFTER_DISPATCH,
-              message: "Daemon restarted after native dispatch began; the job was not replayed",
-            },
-          }),
-        );
+    await this.#serialized(async () => {
+      const timestamp = checkedTimestamp(this.#configuration.nowUnixMs());
+      // Recovery queries only active rows; startup integrity scanning is separate.
+      if (this.#database !== undefined) {
+        let current = this.#database.firstActive();
+        let changed = false;
+        while (current !== undefined) {
+          this.#database.replace(recoveredJob(current, timestamp));
+          changed = true;
+          current = this.#database.firstActive();
+        }
+        if (changed) this.#database.advanceRevision(0);
       } else {
-        next.set(jobId, job);
+        for (const [id, job] of this.#jobs) {
+          if (!isTerminal(job.status)) this.#jobs.set(id, recoveredJob(job, timestamp));
+        }
       }
-    }
-    if (changed) await this.#commit(next);
+    });
   }
 
   #timestampAfter(previous: number): number {
     return Math.max(previous, checkedTimestamp(this.#configuration.nowUnixMs()));
   }
 
-  async #commit(candidate: Map<string, StoredJob>): Promise<void> {
-    const revision = this.#nextRevision();
-    if (this.#configuration.snapshotPath !== undefined) {
-      await writeSnapshot(this.#configuration.snapshotPath, revision, candidate);
+  #commit(job: StoredJob, insert = false): void {
+    if (this.#database !== undefined) {
+      this.#database.commitJob(job, insert, this.#configuration.maxJobs);
+      return;
     }
-    this.#jobs = candidate;
+    const revision = this.#nextRevision();
+    if (insert) this.#jobs = this.#prunedForInsert();
+    this.#jobs.set(job.jobId, job);
     this.#revision = revision;
   }
 
   #serialized<T>(operation: () => Promise<T>): Promise<T> {
-    const scheduled = this.#tail.then(operation, operation);
+    const scheduled = this.#tail.then(async () => {
+      this.#database?.begin();
+      try {
+        const result = await operation();
+        this.#database?.commit();
+        return result;
+      } catch (error) {
+        this.#database?.rollback();
+        throw error;
+      }
+    });
     this.#tail = scheduled.then(
       () => undefined,
       () => undefined,
@@ -663,6 +724,445 @@ class DirectJobCore {
     }
     return revision;
   }
+}
+
+/** Per-row checksums cover payloads and are checked against every indexed projection. */
+class SqliteJobLedger {
+  readonly #statements = new Map<string, StatementSync>();
+  #metadata: LedgerMetadata | undefined;
+  #authoritative = false;
+
+  private constructor(
+    readonly database: DatabaseSync,
+    readonly maxResultBytes: number | undefined,
+  ) {}
+
+  static async open(
+    configuration: DirectJobConfiguration & { readonly snapshotPath: string },
+  ): Promise<SqliteJobLedger> {
+    const path = `${configuration.snapshotPath}.sqlite`;
+    let ledger: SqliteJobLedger | undefined;
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      const state = await prepareDirectJobMigration(configuration.snapshotPath);
+      // A committed witness forbids SQLite's create-if-missing behavior, including zero-length files.
+      if (state.committed !== undefined && (await stat(path)).size === 0) {
+        throw new DirectJobSnapshotError("Authoritative direct job SQLite database is empty");
+      }
+      // r+ must succeed for a committed ledger; never recreate a missing authoritative database.
+      const handle = await open(path, state.committed === undefined ? "a" : "r+", 0o600);
+      await handle.close();
+      const database = new DatabaseSync(path);
+      ledger = new SqliteJobLedger(database, configuration.maxResultBytes);
+      database.exec(`
+        PRAGMA busy_timeout = 5000;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = FULL;
+        PRAGMA cache_size = -4096;
+        PRAGMA temp_store = FILE;
+      `);
+      database.exec("BEGIN IMMEDIATE");
+      const tables = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+      if (tables.length === 0) {
+        if (state.committed !== undefined) {
+          throw new DirectJobSnapshotError("Authoritative direct job SQLite schema is missing");
+        }
+        await assertDirectJobMigrationSource(configuration.snapshotPath, state);
+        database.exec(`
+          CREATE TABLE direct_job_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL, checksum TEXT NOT NULL
+          );
+          CREATE TABLE direct_job_migration (
+            id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL, checksum TEXT NOT NULL
+          );
+          CREATE TABLE direct_jobs (
+            job_id TEXT PRIMARY KEY, owner_digest TEXT NOT NULL,
+            conversation_digest TEXT NOT NULL, work_session_digest TEXT NOT NULL,
+            status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            payload TEXT NOT NULL, checksum TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX direct_jobs_scope ON direct_jobs
+            (owner_digest, conversation_digest, work_session_digest, created_at DESC, job_id DESC);
+          CREATE INDEX direct_jobs_scope_status ON direct_jobs
+            (owner_digest, conversation_digest, work_session_digest, status, created_at DESC, job_id DESC);
+          CREATE INDEX direct_jobs_active ON direct_jobs(job_id)
+            WHERE status IN ('queued', 'running');
+          CREATE INDEX direct_jobs_terminal ON direct_jobs(updated_at, job_id)
+            WHERE status IN ('succeeded', 'failed', 'outcome_unknown', 'cancelled');
+        `);
+        await ledger.#migrate(configuration.snapshotPath);
+        await assertDirectJobMigrationSource(configuration.snapshotPath, state);
+        const metadata = ledger.#metadata;
+        if (metadata === undefined)
+          throw new DirectJobSnapshotError("Migration metadata is missing");
+        const bootstrap: MigrationBootstrap = {
+          schemaVersion: 1,
+          pendingChecksum: state.pendingChecksum,
+          initialRevision: metadata.revision,
+          initialJobCount: metadata.jobCount,
+          legacyChecksum: metadata.legacyChecksum,
+        };
+        const payload = canonicalJson(bootstrap);
+        database
+          .prepare("INSERT INTO direct_job_migration VALUES (1, ?, ?)")
+          .run(payload, digestText(payload));
+      } else {
+        const check = database.prepare("PRAGMA quick_check").all();
+        if (check.length !== 1 || Object.values(check[0] ?? {})[0] !== "ok") {
+          throw new DirectJobSnapshotError("Direct job SQLite integrity check failed");
+        }
+        ledger.#metadata = ledger.#readMetadata();
+        let count = 0;
+        // Startup verifies ALL results, but never retains the entire ledger in JS memory.
+        for (const row of database.prepare("SELECT * FROM direct_jobs").iterate()) {
+          ledger.#decode(row);
+          count += 1;
+        }
+        if (count !== ledger.#metadata.jobCount) {
+          throw new DirectJobSnapshotError("Direct job SQLite job count does not match");
+        }
+      }
+      database.exec("COMMIT");
+      // Publication is serialized by SQLite's writer lock, after the import COMMIT.
+      // No recovery fencing or public operation can run until the witness append is synced.
+      database.exec("BEGIN IMMEDIATE");
+      const bootstrap = ledger.#readBootstrap(state);
+      ledger.#metadata = ledger.#readMetadata();
+      if (
+        ledger.#metadata.revision < bootstrap.initialRevision ||
+        ledger.#metadata.legacyChecksum !== bootstrap.legacyChecksum
+      ) {
+        throw new DirectJobSnapshotError(
+          "Direct job metadata does not match the migration baseline",
+        );
+      }
+      if (
+        state.committed === undefined &&
+        (ledger.#metadata.revision !== bootstrap.initialRevision ||
+          ledger.#metadata.jobCount !== bootstrap.initialJobCount ||
+          ledger.#metadata.legacyChecksum !== bootstrap.legacyChecksum)
+      ) {
+        throw new DirectJobSnapshotError(
+          "Pending direct job migration contains post-migration writes",
+        );
+      }
+      await commitDirectJobMigration(configuration.snapshotPath, state, digestJson(bootstrap));
+      database.exec("COMMIT");
+      ledger.#authoritative = true;
+      return ledger;
+    } catch (error) {
+      ledger?.rollback();
+      ledger?.database.close();
+      // Never fall back to legacy JSON when a committed SQLite ledger is invalid.
+      if (error instanceof DirectJobSnapshotError) throw error;
+      throw new DirectJobSnapshotError(
+        `Direct job SQLite open/migration failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  async #migrate(path: string): Promise<void> {
+    let before: Awaited<ReturnType<typeof stat>>;
+    try {
+      before = await stat(path);
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
+      this.#writeMetadata({ schemaVersion: 1, revision: 0, jobCount: 0, legacyChecksum: null });
+      return;
+    }
+    const migrated = await readLegacyDirectJobs(path, (value, index) => {
+      const job = validateStoredJob(value, index, this.maxResultBytes);
+      const payload = canonicalJson(job);
+      this.#insert(job, payload);
+      return payload;
+    });
+    const after = await stat(path);
+    if (
+      before.size !== after.size ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.ino !== after.ino
+    ) {
+      throw new DirectJobSnapshotError("Direct job legacy source changed during migration");
+    }
+    // Schema, every row and the bootstrap seal commit together; the external witness follows.
+    this.#writeMetadata({
+      schemaVersion: 1,
+      revision: migrated.revision,
+      jobCount: migrated.jobCount,
+      legacyChecksum: migrated.checksum,
+    });
+  }
+
+  #readBootstrap(state: DirectJobMigrationState): MigrationBootstrap {
+    const rows = this.database.prepare("SELECT * FROM direct_job_migration").all();
+    const row = rows[0];
+    if (
+      rows.length !== 1 ||
+      row?.id !== 1 ||
+      typeof row.payload !== "string" ||
+      digestText(row.payload) !== row.checksum
+    ) {
+      throw new DirectJobSnapshotError("Direct job migration bootstrap checksum does not match");
+    }
+    const value: unknown = JSON.parse(row.payload);
+    if (!isObject(value))
+      throw new DirectJobSnapshotError("Direct job migration bootstrap is invalid");
+    assertExactKeys(
+      value,
+      ["schemaVersion", "pendingChecksum", "initialRevision", "initialJobCount", "legacyChecksum"],
+      "bootstrap",
+    );
+    if (
+      value.schemaVersion !== 1 ||
+      value.pendingChecksum !== state.pendingChecksum ||
+      !Number.isSafeInteger(value.initialRevision) ||
+      (value.initialRevision as number) < 0 ||
+      !Number.isSafeInteger(value.initialJobCount) ||
+      (value.initialJobCount as number) < 0 ||
+      (state.pending.source === null
+        ? value.legacyChecksum !== null
+        : typeof value.legacyChecksum !== "string" ||
+          !/^[a-f0-9]{64}$/u.test(value.legacyChecksum)) ||
+      (state.committed !== undefined && digestJson(value) !== state.committed.bootstrapChecksum)
+    ) {
+      throw new DirectJobSnapshotError(
+        "Direct job migration bootstrap does not match external state",
+      );
+    }
+    return value as unknown as MigrationBootstrap;
+  }
+
+  #statement(sql: string): StatementSync {
+    let statement = this.#statements.get(sql);
+    if (statement === undefined) {
+      statement = this.database.prepare(sql);
+      this.#statements.set(sql, statement);
+    }
+    return statement;
+  }
+
+  begin(): void {
+    if (!this.#authoritative)
+      throw new DirectJobSnapshotError("Direct job authority is not durable");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#metadata = this.#readMetadata();
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  commit(): void {
+    this.database.exec("COMMIT");
+  }
+
+  rollback(): void {
+    if (this.database.isTransaction) this.database.exec("ROLLBACK");
+    this.#metadata = undefined;
+  }
+
+  close(): void {
+    this.database.close();
+  }
+
+  #readMetadata(): LedgerMetadata {
+    const rows = this.#statement("SELECT * FROM direct_job_meta").all();
+    const row = rows[0];
+    if (
+      rows.length !== 1 ||
+      row?.id !== 1 ||
+      typeof row.payload !== "string" ||
+      digestText(row.payload) !== row.checksum
+    ) {
+      throw new DirectJobSnapshotError("Direct job SQLite metadata checksum does not match");
+    }
+    const value: unknown = JSON.parse(row.payload);
+    if (!isObject(value)) throw new DirectJobSnapshotError("Direct job SQLite metadata is invalid");
+    assertExactKeys(value, ["schemaVersion", "revision", "jobCount", "legacyChecksum"], "metadata");
+    if (
+      value.schemaVersion !== 1 ||
+      !Number.isSafeInteger(value.revision) ||
+      (value.revision as number) < 0 ||
+      !Number.isSafeInteger(value.jobCount) ||
+      (value.jobCount as number) < 0 ||
+      (value.legacyChecksum !== null &&
+        (typeof value.legacyChecksum !== "string" || !/^[a-f0-9]{64}$/u.test(value.legacyChecksum)))
+    ) {
+      throw new DirectJobSnapshotError("Direct job SQLite metadata is invalid");
+    }
+    return value as unknown as LedgerMetadata;
+  }
+
+  #writeMetadata(metadata: LedgerMetadata): void {
+    const payload = canonicalJson(metadata);
+    this.#statement(`INSERT INTO direct_job_meta VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, checksum = excluded.checksum`).run(
+      payload,
+      digestText(payload),
+    );
+    this.#metadata = metadata;
+  }
+
+  advanceRevision(countDelta: number): void {
+    const current = this.#metadata;
+    if (current === undefined || !Number.isSafeInteger(current.revision + 1)) {
+      throw new DirectJobSnapshotError("Direct job revision space is exhausted");
+    }
+    this.#writeMetadata({
+      ...current,
+      revision: current.revision + 1,
+      jobCount: current.jobCount + countDelta,
+    });
+  }
+
+  #decode(row: Record<string, unknown>): StoredJob {
+    if (typeof row.payload !== "string" || digestText(row.payload) !== row.checksum) {
+      throw new DirectJobSnapshotError("Direct job SQLite row checksum does not match");
+    }
+    const job = validateStoredJob(JSON.parse(row.payload) as unknown, 0, this.maxResultBytes);
+    if (
+      row.job_id !== job.jobId ||
+      row.owner_digest !== job.ownerDigest ||
+      row.conversation_digest !== job.conversationDigest ||
+      row.work_session_digest !== job.workSessionDigest ||
+      row.status !== job.status ||
+      row.created_at !== job.createdAtUnixMs ||
+      row.updated_at !== job.updatedAtUnixMs
+    ) {
+      throw new DirectJobSnapshotError(
+        "Direct job SQLite indexed fields do not match the checksum payload",
+      );
+    }
+    return job;
+  }
+
+  get(jobId: string): StoredJob | undefined {
+    const row = this.#statement("SELECT * FROM direct_jobs WHERE job_id = ?").get(jobId);
+    return row === undefined ? undefined : this.#decode(row);
+  }
+
+  firstActive(): StoredJob | undefined {
+    const row = this.#statement(
+      "SELECT * FROM direct_jobs WHERE status IN ('queued', 'running') ORDER BY job_id LIMIT 1",
+    ).get();
+    return row === undefined ? undefined : this.#decode(row);
+  }
+
+  #insert(job: StoredJob, payload = canonicalJson(job)): void {
+    this.#statement("INSERT INTO direct_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      job.jobId,
+      job.ownerDigest,
+      job.conversationDigest,
+      job.workSessionDigest,
+      job.status,
+      job.createdAtUnixMs,
+      job.updatedAtUnixMs,
+      payload,
+      digestText(payload),
+    );
+  }
+
+  replace(job: StoredJob): void {
+    const payload = canonicalJson(job);
+    const result = this.#statement(`UPDATE direct_jobs SET status = ?, updated_at = ?,
+      payload = ?, checksum = ? WHERE job_id = ?`).run(
+      job.status,
+      job.updatedAtUnixMs,
+      payload,
+      digestText(payload),
+      job.jobId,
+    );
+    if (result.changes !== 1)
+      throw new DirectJobSnapshotError("Direct job disappeared during update");
+  }
+
+  commitJob(job: StoredJob, insert: boolean, maxJobs: number | undefined): void {
+    let removed = 0;
+    if (insert) {
+      const count = this.#metadata?.jobCount ?? 0;
+      while (maxJobs !== undefined && count - removed >= maxJobs) {
+        const row = this.#statement(`SELECT * FROM direct_jobs
+          WHERE status IN ('succeeded', 'failed', 'outcome_unknown', 'cancelled')
+          ORDER BY updated_at, job_id LIMIT 1`).get();
+        if (row === undefined) {
+          throw new DirectJobStateError("Direct job capacity is exhausted by active jobs");
+        }
+        const oldest = this.#decode(row);
+        this.#statement("DELETE FROM direct_jobs WHERE job_id = ?").run(oldest.jobId);
+        removed += 1;
+      }
+      this.#insert(job);
+    } else {
+      this.replace(job);
+    }
+    this.advanceRevision((insert ? 1 : 0) - removed);
+  }
+
+  list(input: DirectJobListInput, scope: ScopeDigests): DirectJobListView {
+    const conditions = ["owner_digest = ?", "conversation_digest = ?", "work_session_digest = ?"];
+    const parameters: SQLInputValue[] = [
+      scope.ownerDigest,
+      scope.conversationDigest,
+      scope.workSessionDigest,
+    ];
+    if (input.statuses !== undefined) {
+      conditions.push(
+        input.statuses.length === 0
+          ? "0"
+          : `status IN (${input.statuses.map(() => "?").join(",")})`,
+      );
+      parameters.push(...input.statuses);
+    }
+    if (input.cursor !== undefined) {
+      const cursor = parseListCursor(input.cursor);
+      const anchor = this.get(cursor.jobId);
+      if (
+        anchor === undefined ||
+        !scopeMatches(anchor, scope) ||
+        anchor.createdAtUnixMs !== cursor.createdAtUnixMs ||
+        (input.statuses !== undefined && !input.statuses.includes(anchor.status))
+      ) {
+        throw new TypeError("Direct job list cursor is stale or outside this scope");
+      }
+      // Fixed lowercase UUIDs have the same binary and en locale ordering.
+      conditions.push("(created_at, job_id) < (?, ?)");
+      parameters.push(cursor.createdAtUnixMs, cursor.jobId);
+    }
+    let sql = `SELECT * FROM direct_jobs WHERE ${conditions.join(" AND ")}
+      ORDER BY created_at DESC, job_id DESC`;
+    if (input.limit !== undefined) {
+      sql += " LIMIT ?";
+      parameters.push(Math.min(input.limit + 1, Number.MAX_SAFE_INTEGER));
+    }
+    const jobs: DirectJobView[] = [];
+    let last: StoredJob | undefined;
+    for (const row of this.#statement(sql).iterate(...parameters)) {
+      if (input.limit !== undefined && jobs.length === input.limit && last !== undefined) {
+        return { jobs, nextCursor: listCursor(last) };
+      }
+      last = this.#decode(row);
+      jobs.push(publicView(last));
+    }
+    return { jobs };
+  }
+}
+
+function recoveredJob(job: StoredJob, timestamp: number): StoredJob {
+  const queued = job.status === "queued";
+  return terminalJob(
+    job,
+    queued ? "cancelled" : "outcome_unknown",
+    Math.max(timestamp, job.updatedAtUnixMs),
+    {
+      error: {
+        code: queued ? RESTART_BEFORE_DISPATCH : RESTART_AFTER_DISPATCH,
+        message: queued
+          ? "Daemon restarted before native dispatch began; the job is safe to resubmit"
+          : "Daemon restarted after native dispatch began; the job was not replayed",
+      },
+    },
+  );
 }
 
 interface ScopeDigests {
@@ -757,7 +1257,7 @@ function listCursor(job: StoredJob): string {
   ).toString("base64url");
 }
 
-function listStart(jobs: readonly StoredJob[], cursor: string): number {
+function parseListCursor(cursor: string): { createdAtUnixMs: number; jobId: string } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
@@ -768,8 +1268,13 @@ function listStart(jobs: readonly StoredJob[], cursor: string): number {
     throw new TypeError("Direct job list cursor is invalid");
   }
   const jobId = requiredIdentifier(parsed.jobId, "cursor.jobId", 128);
+  return { createdAtUnixMs: parsed.createdAtUnixMs as number, jobId };
+}
+
+function listStart(jobs: readonly StoredJob[], cursor: string): number {
+  const parsed = parseListCursor(cursor);
   const index = jobs.findIndex(
-    (job) => job.createdAtUnixMs === parsed.createdAtUnixMs && job.jobId === jobId,
+    (job) => job.createdAtUnixMs === parsed.createdAtUnixMs && job.jobId === parsed.jobId,
   );
   if (index < 0) throw new TypeError("Direct job list cursor is stale or outside this scope");
   return index + 1;
@@ -1097,60 +1602,6 @@ function processCoreRegistry(): Map<string, CoreRegistryEntry> {
   return registry;
 }
 
-async function loadSnapshot(
-  path: string,
-  maxResultBytes: number | undefined,
-): Promise<{ readonly revision: number; readonly jobs: Map<string, StoredJob> }> {
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) return { revision: 0, jobs: new Map() };
-    throw error;
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new DirectJobSnapshotError("Direct job snapshot is not valid JSON");
-  }
-  const snapshot = validateSnapshot(value, maxResultBytes);
-  const { checksum: storedChecksum, ...payload } = snapshot;
-  if (checksum(payload) !== storedChecksum) {
-    throw new DirectJobSnapshotError("Direct job snapshot checksum does not match");
-  }
-  return {
-    revision: snapshot.revision,
-    jobs: new Map(snapshot.jobs.map((job) => [job.jobId, job])),
-  };
-}
-
-function validateSnapshot(value: unknown, maxResultBytes: number | undefined): StoredSnapshot {
-  if (!isObject(value)) throw new DirectJobSnapshotError("Direct job snapshot must be an object");
-  assertExactKeys(value, ["schemaVersion", "revision", "jobs", "checksum"], "snapshot");
-  if (value.schemaVersion !== SCHEMA_VERSION) {
-    throw new DirectJobSnapshotError("Direct job snapshot schema version is unsupported");
-  }
-  if (!Number.isSafeInteger(value.revision) || (value.revision as number) < 0) {
-    throw new DirectJobSnapshotError("Direct job snapshot revision is invalid");
-  }
-  if (!Array.isArray(value.jobs)) {
-    throw new DirectJobSnapshotError("Direct job snapshot jobs must be an array");
-  }
-  const jobs = value.jobs.map((job, index) => validateStoredJob(job, index, maxResultBytes));
-  const ids = new Set(jobs.map((job) => job.jobId));
-  if (ids.size !== jobs.length) throw new DirectJobSnapshotError("Direct job IDs are duplicated");
-  if (typeof value.checksum !== "string" || !/^[a-f0-9]{64}$/u.test(value.checksum)) {
-    throw new DirectJobSnapshotError("Direct job snapshot checksum is invalid");
-  }
-  return {
-    schemaVersion: SCHEMA_VERSION,
-    revision: value.revision as number,
-    jobs,
-    checksum: value.checksum,
-  };
-}
-
 function validateStoredJob(
   value: unknown,
   index: number,
@@ -1300,37 +1751,6 @@ function assertExactKeys(
   if (required.some((key) => !Object.hasOwn(value, key))) {
     throw new DirectJobSnapshotError(`${label} is missing required fields`);
   }
-}
-
-async function writeSnapshot(
-  path: string,
-  revision: number,
-  jobs: ReadonlyMap<string, StoredJob>,
-): Promise<void> {
-  const payload: SnapshotPayload = {
-    schemaVersion: SCHEMA_VERSION,
-    revision,
-    jobs: [...jobs.values()].sort((left, right) => left.jobId.localeCompare(right.jobId, "en")),
-  };
-  const snapshot: StoredSnapshot = { ...payload, checksum: checksum(payload) };
-  await mkdir(dirname(path), { recursive: true });
-  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(temporaryPath, "wx", 0o600);
-    await handle.writeFile(canonicalJson(snapshot), "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(temporaryPath, path);
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
-  }
-}
-
-function checksum(payload: SnapshotPayload): string {
-  return createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

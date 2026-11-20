@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -14,8 +15,10 @@ import {
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
+const openStores: DirectJobStore[] = [];
 
 afterEach(async () => {
+  await Promise.all(openStores.splice(0).map((store) => store.close()));
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -24,7 +27,7 @@ afterEach(async () => {
 describe("DirectJobStore", () => {
   it("binds idempotency to exact work and never persists scope identities or native arguments", async () => {
     const fixture = await durableFixture();
-    const store = await DirectJobStore.open({ snapshotPath: fixture.snapshotPath });
+    const store = await openStore(fixture.snapshotPath);
     const targetContract = {
       catalogRevision: "a".repeat(64),
       targetIdentity: "app_server\0fs/readFile",
@@ -45,16 +48,17 @@ describe("DirectJobStore", () => {
       store.start({ ...input, arguments: { path: "C:/other.txt" } }),
     ).rejects.toBeInstanceOf(DirectJobConflictError);
 
-    const snapshot = await readFile(fixture.snapshotPath, "utf8");
+    const database = new DatabaseSync(`${fixture.snapshotPath}.sqlite`, { readOnly: true });
+    const snapshot = database.prepare("SELECT payload FROM direct_jobs").get()?.payload as string;
+    database.close();
     expect(snapshot).not.toContain(input.authorizationBinding);
     expect(snapshot).not.toContain(input.conversationId);
     expect(snapshot).not.toContain(input.workSessionId);
     expect(snapshot).not.toContain(input.idempotencyKey);
     expect(snapshot).not.toContain("C:/workspace/file.txt");
-    expect(
-      (JSON.parse(snapshot) as { jobs: Array<{ targetContract?: unknown }> }).jobs[0]
-        ?.targetContract,
-    ).toEqual(targetContract);
+    expect((JSON.parse(snapshot) as { targetContract?: unknown }).targetContract).toEqual(
+      targetContract,
+    );
   });
 
   it("looks up an existing exact fingerprint without creating an absent job", async () => {
@@ -94,7 +98,7 @@ describe("DirectJobStore", () => {
 
   it("persists and reopens the complete JSON-safe error envelope without field loss", async () => {
     const fixture = await durableFixture();
-    const store = await DirectJobStore.open({ snapshotPath: fixture.snapshotPath });
+    const store = await openStore(fixture.snapshotPath);
     const input = startInput("structured-error-envelope-0001");
     const created = await store.start(input);
     const access = accessInput(input, created.job.jobId);
@@ -211,7 +215,7 @@ describe("DirectJobStore", () => {
 
   it("recovers queued work as safely cancelled and dispatched work as outcome_unknown", async () => {
     const queuedFixture = await durableFixture();
-    const queuedStore = await DirectJobStore.open({ snapshotPath: queuedFixture.snapshotPath });
+    const queuedStore = await openStore(queuedFixture.snapshotPath);
     const queuedInput = startInput("restart-queued-0001");
     const queued = await queuedStore.start(queuedInput);
     const recoveredQueued = await readInFreshProcess(
@@ -230,7 +234,7 @@ describe("DirectJobStore", () => {
     ).toMatchObject({ status: "cancelled" });
 
     const runningFixture = await durableFixture();
-    const runningStore = await DirectJobStore.open({ snapshotPath: runningFixture.snapshotPath });
+    const runningStore = await openStore(runningFixture.snapshotPath);
     const runningInput = startInput("restart-running-001");
     const running = await runningStore.start(runningInput);
     const runningAccess = accessInput(runningInput, running.job.jobId);
@@ -256,7 +260,7 @@ describe("DirectJobStore", () => {
 
   it("persists and reopens a result larger than the former implicit limit by default", async () => {
     const fixture = await durableFixture();
-    const store = await DirectJobStore.open({ snapshotPath: fixture.snapshotPath });
+    const store = await openStore(fixture.snapshotPath);
     const input = startInput("lossless-large-result-0001");
     const created = await store.start(input);
     const access = accessInput(input, created.job.jobId);
@@ -319,9 +323,17 @@ function accessInput(input: DirectJobStartInput, jobId: string): DirectJobAccess
 }
 
 async function durableFixture(): Promise<{ readonly snapshotPath: string }> {
-  const directory = await mkdtemp(join(tmpdir(), "omnicodex-direct-jobs-"));
+  const directory = await mkdtemp(
+    join(process.env.PI_SCRATCH_DIR ?? tmpdir(), "omnicodex-direct-jobs-"),
+  );
   temporaryDirectories.push(directory);
   return { snapshotPath: join(directory, "direct-job-store.json") };
+}
+
+async function openStore(snapshotPath: string): Promise<DirectJobStore> {
+  const store = await DirectJobStore.open({ snapshotPath });
+  openStores.push(store);
+  return store;
 }
 
 async function readInFreshProcess(
