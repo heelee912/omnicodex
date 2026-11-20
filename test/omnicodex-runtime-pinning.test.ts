@@ -463,6 +463,47 @@ it("connects to the physical Desktop build while pinning owned processes and fol
   expect(harness.starts).toHaveLength(startsAfterSwitch);
 });
 
+it("bounds completed Gateway reads while preserving in-flight joins and recent replays", async () => {
+  const { old } = await fixture();
+  await serviceFor([old]).start();
+  const cache = harness.gatewayOptions?.readInvocationCoordinator;
+  if (cache === undefined) throw new Error("Gateway did not share its read coordinator");
+  const identity = (key: string) => ({
+    authorizationBinding: "synthetic-owner",
+    invocationId: key,
+    targetIdentity: "native-read",
+    fingerprint: "a".repeat(64),
+  });
+
+  const oversized = cache.acquire<{ readonly payload: string }>(identity("oversized"));
+  if (oversized.kind !== "execute") throw new Error("Expected the first read to execute");
+  const joined = cache.acquire<{ readonly payload: string }>(identity("oversized"));
+  expect(joined.kind).toBe("join");
+  oversized.execution.finish({ payload: "x".repeat(4 * 1024 * 1024) });
+  if (joined.kind !== "join") throw new Error("Expected an in-flight join");
+  expect((await joined.completion).payload).toHaveLength(4 * 1024 * 1024);
+  const fresh = cache.acquire(identity("oversized"));
+  expect(fresh.kind).toBe("execute");
+  if (fresh.kind === "execute") fresh.execution.finish({ ok: true }, false);
+
+  const replayablePayload = "x".repeat(4 * 1024 * 1024 - 64);
+  for (let index = 0; index < 9; index++) {
+    const read = cache.acquire(identity(`large-${index}`));
+    if (read.kind !== "execute") throw new Error("Expected an independent read");
+    read.execution.finish({ payload: replayablePayload });
+  }
+  expect(cache.acquire(identity("large-0")).kind).toBe("execute");
+  expect(cache.acquire(identity("large-8")).kind).toBe("replay");
+
+  for (let index = 0; index < 129; index++) {
+    const read = cache.acquire(identity(`small-${index}`));
+    if (read.kind !== "execute") throw new Error("Expected an independent small read");
+    read.execution.finish({ index });
+  }
+  expect(cache.acquire(identity("small-0")).kind).toBe("execute");
+  expect(cache.acquire(identity("small-128")).kind).toBe("replay");
+});
+
 it.each(["old", "updated"] as const)(
   "skips an incomplete %s build before any spawn and uses only the complete discovered package",
   async (missing) => {

@@ -3378,9 +3378,15 @@ export class OmniCodexGatewayService {
       join(omniCodexDataDirectory(), "engine-generations"),
     );
     throwIfRuntimePreparationAborted(options.signal);
-    // One coordinator is shared by every transport in this prepared runtime,
-    // but never across a hot runtime switch where native snapshots may differ.
-    const readInvocationCoordinator = new ReadInvocationCoordinator();
+    // Completed explicit reads may contain multi-megabyte thread histories.
+    // Keep in-flight joining intact without retaining unbounded results for
+    // the lifetime of this long-running Gateway process. Mutations use their
+    // separate durable replay ledger and are unaffected by this cache policy.
+    const readInvocationCoordinator = new ReadInvocationCoordinator({
+      maxCompletedEntries: 128,
+      maxCompletedBytes: 32 * 1024 * 1024,
+      maxReplayValueBytes: 4 * 1024 * 1024,
+    });
     const desktopIpc = new CodexDesktopIpcClient();
     const appTools = this.#options.appToolsClientFactory?.() ?? new CodexAppToolsPipeClient();
     const runtimeEnvironment = await this.#options.runtimeEnvironment?.();
